@@ -173,34 +173,90 @@ def start_whatsapp():
 
 def send_whatsapp(phone: str, text: str):
     """Отправка сообщения через WhatsApp Web."""
+    from selenium.webdriver.common.keys import Keys
+    import time
+    
     phone = re.sub(r"\D", "", phone)
     url = f"https://web.whatsapp.com/send?phone={phone}&text={quote(text)}"
     
+    print(f"[WA] Открываю URL: {url}")
     driver.get(url)
     
-    # Ждём поля ввода
+    # Ждём загрузки страницы
+    time.sleep(5)
+    
+    # Делаем скриншот для отладки
     try:
-        input_box = WebDriverWait(driver, 30).until(
-            EC.presence_of_element_located(
-                (By.CSS_SELECTOR, "div[contenteditable='true'][data-tab='10']")
-            )
-        )
+        driver.save_screenshot("/app/debug_send.png")
+        print("[WA] Скриншот сохранён: /app/debug_send.png")
     except Exception:
-        # Fallback селектор
-        input_box = WebDriverWait(driver, 15).until(
-            EC.presence_of_element_located(
-                (By.CSS_SELECTOR, "div[contenteditable='true']")
+        pass
+    
+    # Проверяем — нет ли ошибки "номер не найден"
+    page_source = driver.page_source
+    if "phone number shared via url is invalid" in page_source.lower():
+        raise Exception(f"Номер {phone} не найден в WhatsApp")
+    
+    # Список возможных селекторов поля ввода
+    input_selectors = [
+        "div[contenteditable='true'][data-tab='10']",
+        "div[contenteditable='true'][data-tab='1']",
+        "footer div[contenteditable='true']",
+        "div[role='textbox']",
+        "div[contenteditable='true']",
+    ]
+    
+    input_box = None
+    for sel in input_selectors:
+        try:
+            input_box = WebDriverWait(driver, 10).until(
+                EC.element_to_be_clickable((By.CSS_SELECTOR, sel))
             )
-        )
+            print(f"[WA] Поле ввода найдено: {sel}")
+            break
+        except Exception:
+            print(f"[WA] Селектор не сработал: {sel}")
+            continue
     
-    time.sleep(2)
+    if not input_box:
+        # Финальный скриншот с ошибкой
+        png = driver.get_screenshot_as_png()
+        send_to_telegram("❌ Не найдено поле ввода WhatsApp:", png)
+        raise Exception("Поле ввода не найдено ни по одному селектору")
     
-    # Нажимаем Enter для отправки
-    from selenium.webdriver.common.keys import Keys
-    input_box.send_keys(Keys.ENTER)
-    time.sleep(2)
-
-
+    # Кликаем и отправляем
+    try:
+        input_box.click()
+        time.sleep(1)
+        input_box.send_keys(Keys.ENTER)
+        time.sleep(2)
+        print("[WA] Сообщение отправлено через Enter")
+        return
+    except Exception as e:
+        print(f"[WA] Ошибка Enter: {e}")
+    
+    # Fallback: кнопка отправки
+    send_selectors = [
+        "button[data-testid='compose-btn-send']",
+        "button[aria-label='Отправить']",
+        "button[aria-label='Send']",
+        "span[data-testid='send']",
+        "button[data-tab='11']",
+    ]
+    
+    for sel in send_selectors:
+        try:
+            btn = WebDriverWait(driver, 5).until(
+                EC.element_to_be_clickable((By.CSS_SELECTOR, sel))
+            )
+            driver.execute_script("arguments[0].click();", btn)
+            print(f"[WA] Отправлено кнопкой: {sel}")
+            time.sleep(2)
+            return
+        except Exception:
+            continue
+    
+    raise Exception("Не удалось отправить: ни Enter, ни кнопка не сработали")
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != OWNER_ID:
         return
