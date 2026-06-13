@@ -269,99 +269,157 @@ def start_whatsapp():
 
 def send_whatsapp(phone: str, text: str):
     """Отправка сообщения через WhatsApp Web."""
+    from selenium.webdriver.common.action_chains import ActionChains
+
     phone = re.sub(r"\D", "", phone)
     url = f"https://web.whatsapp.com/send?phone={phone}&text={quote(text)}"
 
     print(f"[WA] Открываю URL: {url}")
     driver.get(url)
-    time.sleep(5)
+    time.sleep(8)
 
-    # Закрываем всплывашки
     close_blocking_popups()
     time.sleep(2)
+
+    # Скриншот 1 — что видим после загрузки
+    png1 = driver.get_screenshot_as_png()
+    send_to_telegram("🔍 Шаг 1: Страница после загрузки", png1)
 
     # Проверяем ошибку номера
     page_source = driver.page_source
     if "phone number shared via url is invalid" in page_source.lower():
         raise Exception(f"Номер {phone} не найден в WhatsApp")
 
-    # Ждём появления кнопки "Отправить" — она появляется когда текст вставлен
-    send_selectors = [
+    # Ищем ВСЕ кликабельные элементы и логируем
+    all_buttons = driver.find_elements(By.CSS_SELECTOR, "button")
+    print(f"[WA] Найдено кнопок: {len(all_buttons)}")
+    for btn in all_buttons:
+        try:
+            aria = btn.get_attribute("aria-label") or ""
+            testid = btn.get_attribute("data-testid") or ""
+            tab = btn.get_attribute("data-tab") or ""
+            visible = btn.is_displayed()
+            print(f"  button: aria='{aria}' testid='{testid}' tab='{tab}' visible={visible}")
+        except Exception:
+            pass
+
+    # Ищем все span с data-icon
+    all_icons = driver.find_elements(By.CSS_SELECTOR, "span[data-icon]")
+    print(f"[WA] Найдено иконок: {len(all_icons)}")
+    for icon in all_icons:
+        try:
+            icon_name = icon.get_attribute("data-icon") or ""
+            visible = icon.is_displayed()
+            print(f"  icon: data-icon='{icon_name}' visible={visible}")
+        except Exception:
+            pass
+
+    # Попытка 1: кнопка отправки по всем возможным селекторам
+    send_selectors_css = [
         "button[data-testid='compose-btn-send']",
         "span[data-testid='send']",
+        "span[data-icon='send']",
         "button[aria-label='Send']",
         "button[aria-label='Отправить']",
         "button[data-tab='11']",
     ]
 
-    # Сначала ждём пока текст подгрузится в поле ввода (URL уже содержит text=)
-    time.sleep(3)
-
-    # Пробуем найти и нажать кнопку отправки
-    for sel in send_selectors:
+    for sel in send_selectors_css:
         try:
-            btn = WebDriverWait(driver, 10).until(
-                EC.element_to_be_clickable((By.CSS_SELECTOR, sel))
-            )
-            driver.execute_script("arguments[0].click();", btn)
-            print(f"[WA] ✅ Отправлено кнопкой: {sel}")
-            time.sleep(2)
-            return
+            elements = driver.find_elements(By.CSS_SELECTOR, sel)
+            for el in elements:
+                if el.is_displayed():
+                    driver.execute_script("arguments[0].click();", el)
+                    print(f"[WA] ✅ Клик по: {sel}")
+                    time.sleep(2)
+                    png2 = driver.get_screenshot_as_png()
+                    send_to_telegram(f"✅ Клик по {sel}", png2)
+                    return
         except Exception:
-            print(f"[WA] Кнопка не найдена: {sel}")
-            continue
+            pass
 
-    # Fallback: ищем кнопку через XPATH
-    xpath_selectors = [
-        "//button[@data-testid='compose-btn-send']",
-        "//span[@data-testid='send']/ancestor::button",
-        "//button[.//span[@data-icon='send']]",
-    ]
-
-    for sel in xpath_selectors:
-        try:
-            btn = WebDriverWait(driver, 5).until(
-                EC.element_to_be_clickable((By.XPATH, sel))
-            )
-            driver.execute_script("arguments[0].click();", btn)
-            print(f"[WA] ✅ Отправлено XPATH: {sel}")
-            time.sleep(2)
-            return
-        except Exception:
-            print(f"[WA] XPATH не сработал: {sel}")
-            continue
-
-    # Fallback 2: кликаем по span[data-icon='send'] напрямую
+    # Попытка 2: найти data-icon='send' и кликнуть на родителя
     try:
-        send_icon = driver.find_element(By.CSS_SELECTOR, "span[data-icon='send']")
-        parent = send_icon.find_element(By.XPATH, "./..")
-        driver.execute_script("arguments[0].click();", parent)
-        print("[WA] ✅ Отправлено через data-icon='send'")
+        send_icons = driver.find_elements(By.CSS_SELECTOR, "span[data-icon='send']")
+        for icon in send_icons:
+            if icon.is_displayed():
+                parent = icon.find_element(By.XPATH, "./ancestor::button")
+                driver.execute_script("arguments[0].click();", parent)
+                print("[WA] ✅ Клик по parent button от data-icon='send'")
+                time.sleep(2)
+                return
+    except Exception as e:
+        print(f"[WA] ancestor::button не найден: {e}")
+
+    # Попытка 3: кликнуть по самой иконке send
+    try:
+        send_icons = driver.find_elements(By.CSS_SELECTOR, "span[data-icon='send']")
+        for icon in send_icons:
+            if icon.is_displayed():
+                driver.execute_script("arguments[0].click();", icon)
+                print("[WA] ✅ Клик по span[data-icon='send']")
+                time.sleep(2)
+                return
+    except Exception:
+        pass
+
+    # Попытка 4: JavaScript клик по координатам кнопки
+    try:
+        driver.execute_script("""
+            var btns = document.querySelectorAll('span[data-icon="send"]');
+            if (btns.length > 0) {
+                btns[0].closest('button').click();
+                return true;
+            }
+            return false;
+        """)
+        print("[WA] ✅ JS клик по send")
         time.sleep(2)
+        png3 = driver.get_screenshot_as_png()
+        send_to_telegram("✅ JS клик по send", png3)
         return
     except Exception:
-        print("[WA] data-icon='send' не найден")
+        pass
 
-    # Последний fallback: ищем поле ввода и жмём Enter
+    # Попытка 5: ActionChains на поле ввода + Enter
     try:
-        input_box = driver.find_element(By.CSS_SELECTOR, "div[contenteditable='true']")
-        input_box.click()
-        time.sleep(0.5)
+        input_selectors = [
+            "div[contenteditable='true'][data-tab='10']",
+            "div[contenteditable='true'][data-tab='1']",
+            "footer div[contenteditable='true']",
+            "div[role='textbox']",
+            "div[contenteditable='true']",
+        ]
+        for sel in input_selectors:
+            try:
+                inp = driver.find_element(By.CSS_SELECTOR, sel)
+                if inp.is_displayed():
+                    inp.click()
+                    time.sleep(0.5)
+                    actions = ActionChains(driver)
+                    actions.send_keys(Keys.ENTER)
+                    actions.perform()
+                    print(f"[WA] ✅ ActionChains Enter на: {sel}")
+                    time.sleep(2)
+                    png4 = driver.get_screenshot_as_png()
+                    send_to_telegram(f"✅ Enter на {sel}", png4)
+                    return
+            except Exception:
+                continue
+    except Exception:
+        pass
 
-        # Используем ActionChains для правильного Enter
-        from selenium.webdriver.common.action_chains import ActionChains
-        actions = ActionChains(driver)
-        actions.send_keys(Keys.ENTER)
-        actions.perform()
-        print("[WA] ✅ Отправлено через ActionChains Enter")
-        time.sleep(2)
-        return
-    except Exception as e:
-        print(f"[WA] ActionChains тоже не сработал: {e}")
+    # Ничего не сработало
+    png_final = driver.get_screenshot_as_png()
+    send_to_telegram("❌ Ни один метод отправки не сработал. Скриншот:", png_final)
 
-    # Если ничего не помогло — скриншот
-    png = driver.get_screenshot_as_png()
-    send_to_telegram("❌ Не удалось нажать кнопку отправки. Скриншот:", png)
+    # Дамп HTML для анализа
+    try:
+        html = driver.page_source[:3000]
+        send_to_telegram(f"📄 HTML (первые 3000 символов):\n{html}")
+    except Exception:
+        pass
+
     raise Exception("Не удалось отправить: ни одна кнопка/метод не сработали")
 
 
