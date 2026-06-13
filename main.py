@@ -108,7 +108,23 @@ def wait_for_qr():
     
     return "timeout"
 
-
+async def debug_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Отправляет скриншот текущего состояния браузера."""
+    if update.effective_user.id != OWNER_ID:
+        return
+    if not driver:
+        await update.message.reply_text("❌ Браузер не запущен")
+        return
+    try:
+        png = driver.get_screenshot_as_png()
+        url = driver.current_url
+        await update.message.reply_photo(
+            png, 
+            caption=f"🔍 Текущий URL:\n{url}"
+        )
+    except Exception as e:
+        await update.message.reply_text(f"❌ Ошибка скриншота: {e}")
+        
 def start_whatsapp():
     global driver, wa_ready
 
