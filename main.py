@@ -22,7 +22,7 @@ SESSION_DIR = os.path.join(os.getcwd(), "chrome_session")
 driver = None
 wa_ready = False
 bot_app = None
-main_loop = None   # будем хранить главный event loop
+main_loop = None
 
 def start_whatsapp():
     global driver, wa_ready, bot_app, main_loop
@@ -39,7 +39,6 @@ def start_whatsapp():
     driver.get("https://web.whatsapp.com")
     print("WhatsApp загружен")
 
-    # Вспомогательная функция для отправки сообщений из потока
     def send_to_telegram(text, photo=None):
         if not bot_app or not main_loop:
             return
@@ -49,8 +48,8 @@ def start_whatsapp():
             coro = bot_app.bot.send_message(OWNER_ID, text)
         asyncio.run_coroutine_threadsafe(coro, main_loop)
 
-    # Проверяем, возможно уже авторизованы
-    for _ in range(10):  # 30 секунд
+    # Проверяем, возможно уже авторизованы (есть чат-лист)
+    for _ in range(10):
         time.sleep(3)
         if driver.find_elements(By.CSS_SELECTOR, "div[data-testid='chat-list']"):
             wa_ready = True
@@ -58,27 +57,25 @@ def start_whatsapp():
             send_to_telegram("✅ WhatsApp готов!")
             return
 
-    # Ищем QR и отправляем
+    # Если нет — ищем QR
+    print("Поиск QR-кода...")
     for _ in range(10):
         qr = driver.find_elements(By.CSS_SELECTOR, "canvas[aria-label='QR code']")
         if qr:
             png = driver.get_screenshot_as_png()
             send_to_telegram("🔐 Отсканируйте QR-код в WhatsApp Web", png)
             print("QR отправлен в Telegram")
-            # Ждём сканирования (до 2 минут)
-            for _ in range(40):
-                time.sleep(3)
+            # Бесконечно ждём авторизации
+            while True:
+                time.sleep(5)
                 if driver.find_elements(By.CSS_SELECTOR, "div[data-testid='chat-list']"):
                     wa_ready = True
                     print("✅ WhatsApp авторизован после QR")
                     send_to_telegram("✅ WhatsApp готов!")
                     return
-            # Если не дождались
-            send_to_telegram("⚠️ Время ожидания сканирования истекло")
-            return
         time.sleep(3)
 
-    # Если QR не найден
+    # Если за 30 секунд QR не появился
     png = driver.get_screenshot_as_png()
     send_to_telegram("❌ Не удалось найти QR-код. Проверьте логи.", png)
     wa_ready = False
@@ -140,21 +137,18 @@ def main():
         print("✅ Вебхук сброшен")
     except Exception as e:
         print(f"⚠️ Ошибка сброса вебхука: {e}")
-    time.sleep(2)  # даём время Telegram обработать
+    time.sleep(2)
 
     bot_app = Application.builder().token(TOKEN).build()
     bot_app.add_handler(CommandHandler("start", start_cmd))
     bot_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
 
-    # Сохраняем главный event loop (он создаётся в run_polling)
     main_loop = asyncio.new_event_loop()
     asyncio.set_event_loop(main_loop)
 
-    # Запускаем WhatsApp в отдельном потоке
     threading.Thread(target=start_whatsapp, daemon=True).start()
 
     print("🚀 Бот запущен")
-    # Важно: run_polling должен использовать тот же loop, что мы сохранили
     bot_app.run_polling(drop_pending_updates=True, allowed_updates=["message"])
 
 if __name__ == "__main__":
