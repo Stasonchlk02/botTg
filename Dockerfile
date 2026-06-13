@@ -16,5 +16,5 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 COPY . .
-
-CMD ["python", "bot.py"]
+# ✅ Исправлено: bot.py -> main.py
+CMD ["python", "main.py"]
