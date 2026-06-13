@@ -14,6 +14,7 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.common.keys import Keys
+from selenium.webdriver.common.action_chains import ActionChains
 from selenium.common.exceptions import TimeoutException
 
 TOKEN = os.getenv("TELEGRAM_TOKEN")
@@ -25,6 +26,8 @@ wa_ready = False
 bot_app = None
 main_loop = None
 
+
+# ==================== BROWSER ====================
 
 def get_driver():
     options = Options()
@@ -51,6 +54,8 @@ def get_driver():
     return webdriver.Chrome(service=service, options=options)
 
 
+# ==================== TELEGRAM HELPER ====================
+
 def send_to_telegram(text, photo=None):
     if not bot_app or not main_loop:
         print(f"[WA→TG] bot_app или main_loop не готов: {text}")
@@ -64,6 +69,23 @@ def send_to_telegram(text, photo=None):
         future.result(timeout=10)
     except Exception as e:
         print(f"[send_to_telegram] Ошибка: {e}")
+
+
+# ==================== POPUP / DIALOG HELPERS ====================
+
+def click_visible(el):
+    """Надёжный клик по элементу."""
+    try:
+        driver.execute_script(
+            "arguments[0].scrollIntoView({block: 'center'});", el
+        )
+        time.sleep(0.3)
+    except Exception:
+        pass
+    try:
+        el.click()
+    except Exception:
+        driver.execute_script("arguments[0].click();", el)
 
 
 def close_dialog_if_exists():
@@ -87,7 +109,7 @@ def close_dialog_if_exists():
                 ]
                 if any(w in text for w in keywords) or any(w in aria for w in keywords):
                     driver.execute_script("arguments[0].click();", btn)
-                    print(f"✅ Dialog закрыт кнопкой: text='{btn.text}' aria='{aria}'")
+                    print(f"✅ Dialog закрыт: text='{btn.text}' aria='{aria}'")
                     time.sleep(1)
                     return
     except Exception as e:
@@ -95,20 +117,17 @@ def close_dialog_if_exists():
 
 
 def close_blocking_popups():
-    """Закрывает мешающие окна WhatsApp Web: 'Что нового', onboarding и т.п."""
+    """Закрывает мешающие окна WhatsApp Web."""
     if not driver:
         return
 
     popup_selectors = [
-        # Кнопки закрытия
         (By.CSS_SELECTOR, "button[aria-label='Close']"),
         (By.CSS_SELECTOR, "button[aria-label='Закрыть']"),
         (By.CSS_SELECTOR, "div[aria-label='Close']"),
         (By.CSS_SELECTOR, "div[aria-label='Закрыть']"),
         (By.CSS_SELECTOR, "span[data-testid='x']"),
         (By.CSS_SELECTOR, "span[data-testid='x-alt']"),
-
-        # Кнопки подтверждения / продолжения
         (By.XPATH, "//button[contains(., 'Continue')]"),
         (By.XPATH, "//button[contains(., 'Продолжить')]"),
         (By.XPATH, "//button[contains(., 'OK')]"),
@@ -117,7 +136,6 @@ def close_blocking_popups():
         (By.XPATH, "//button[contains(., 'Got it')]"),
         (By.XPATH, "//button[contains(., 'Not now')]"),
         (By.XPATH, "//button[contains(., 'Сейчас не надо')]"),
-
         (By.XPATH, "//div[@role='button'][contains(., 'Continue')]"),
         (By.XPATH, "//div[@role='button'][contains(., 'Продолжить')]"),
         (By.XPATH, "//div[@role='button'][contains(., 'OK')]"),
@@ -130,8 +148,6 @@ def close_blocking_popups():
 
     for attempt in range(5):
         closed_any = False
-
-        # Сначала проверяем диалоги
         close_dialog_if_exists()
 
         for by, selector in popup_selectors:
@@ -149,7 +165,6 @@ def close_blocking_popups():
             except Exception:
                 pass
 
-        # Fallback — Esc
         try:
             body = driver.find_element(By.TAG_NAME, "body")
             body.send_keys(Keys.ESCAPE)
@@ -161,8 +176,45 @@ def close_blocking_popups():
             break
 
 
+def click_continue_screens():
+    """Закрывает промежуточные экраны типа Continue to chat."""
+    texts = [
+        "Continue to chat",
+        "Продолжить чат",
+        "Use WhatsApp Web",
+        "Использовать WhatsApp Web",
+        "Continue",
+        "Продолжить",
+        "OK",
+        "ОК",
+        "Open",
+        "Открыть",
+    ]
+
+    clicked = False
+    for txt in texts:
+        xpath = (
+            f"//button[contains(., '{txt}')] | "
+            f"//div[@role='button'][contains(., '{txt}')] | "
+            f"//a[contains(., '{txt}')]"
+        )
+        try:
+            elements = driver.find_elements(By.XPATH, xpath)
+            for el in elements:
+                if el.is_displayed():
+                    click_visible(el)
+                    print(f"✅ Нажата промежуточная кнопка: {txt}")
+                    time.sleep(2)
+                    clicked = True
+        except Exception:
+            pass
+
+    return clicked
+
+
+# ==================== WHATSAPP AUTH ====================
+
 def is_authorized():
-    """Проверяем авторизацию в WhatsApp Web."""
     try:
         close_blocking_popups()
         selectors = [
@@ -180,7 +232,6 @@ def is_authorized():
 
 
 def wait_for_qr():
-    """Ищем QR-код и отправляем скриншот."""
     qr_selectors = [
         "canvas[aria-label='QR code']",
         "div[data-testid='qrcode']",
@@ -190,11 +241,8 @@ def wait_for_qr():
 
     for attempt in range(20):
         time.sleep(3)
-
-        # Закрываем всплывашки перед каждой проверкой
         close_blocking_popups()
 
-        # Может уже авторизован
         if is_authorized():
             return "authorized"
 
@@ -212,7 +260,6 @@ def wait_for_qr():
 def start_whatsapp():
     global driver, wa_ready
 
-    # Ждём пока main_loop будет готов
     for _ in range(30):
         if main_loop and main_loop.is_running():
             break
@@ -226,7 +273,6 @@ def start_whatsapp():
         driver.get("https://web.whatsapp.com")
         print("🌐 WhatsApp Web загружен")
 
-        # Ждём загрузки страницы и закрываем всплывашки
         time.sleep(5)
         close_blocking_popups()
 
@@ -235,7 +281,7 @@ def start_whatsapp():
         if result == "authorized":
             wa_ready = True
             print("✅ WhatsApp авторизован (сессия восстановлена)")
-            send_to_telegram("✅ WhatsApp готов! Сессия восстановлена автоматически.")
+            send_to_telegram("✅ WhatsApp готов! Сессия восстановлена.")
             return
 
         elif result == "qr_found":
@@ -249,179 +295,316 @@ def start_whatsapp():
                 if is_authorized():
                     wa_ready = True
                     print("✅ WhatsApp авторизован после QR!")
-                    send_to_telegram("✅ WhatsApp авторизован! Можете отправлять сообщения.")
+                    send_to_telegram("✅ WhatsApp авторизован!")
                     return
                 if i % 6 == 5:
                     print(f"⏳ Всё ещё жду... ({(i+1)*5}с)")
 
-            send_to_telegram("❌ QR не был отсканирован за 5 минут. Перезапустите бота.")
-            print("❌ Таймаут ожидания QR")
+            send_to_telegram("❌ QR не отсканирован за 5 минут. /restart")
+            print("❌ Таймаут QR")
 
         else:
             png = driver.get_screenshot_as_png()
-            send_to_telegram("❌ Не удалось найти QR-код. Скриншот страницы:", png)
-            print("❌ QR не найден, скриншот отправлен")
+            send_to_telegram("❌ QR не найден. Скриншот:", png)
+            print("❌ QR не найден")
 
     except Exception as e:
         print(f"❌ Ошибка WhatsApp: {e}")
         send_to_telegram(f"❌ Ошибка запуска WhatsApp: {e}")
 
 
-def send_whatsapp(phone: str, text: str):
-    """Отправка сообщения через WhatsApp Web."""
-    from selenium.webdriver.common.action_chains import ActionChains
+# ==================== SEND MESSAGE HELPERS ====================
 
-    phone = re.sub(r"\D", "", phone)
-    url = f"https://web.whatsapp.com/send?phone={phone}&text={quote(text)}"
-
-    print(f"[WA] Открываю URL: {url}")
-    driver.get(url)
-    time.sleep(8)
-
-    close_blocking_popups()
-    time.sleep(2)
-
-    # Скриншот 1 — что видим после загрузки
-    png1 = driver.get_screenshot_as_png()
-    send_to_telegram("🔍 Шаг 1: Страница после загрузки", png1)
-
-    # Проверяем ошибку номера
-    page_source = driver.page_source
-    if "phone number shared via url is invalid" in page_source.lower():
-        raise Exception(f"Номер {phone} не найден в WhatsApp")
-
-    # Ищем ВСЕ кликабельные элементы и логируем
-    all_buttons = driver.find_elements(By.CSS_SELECTOR, "button")
-    print(f"[WA] Найдено кнопок: {len(all_buttons)}")
-    for btn in all_buttons:
-        try:
-            aria = btn.get_attribute("aria-label") or ""
-            testid = btn.get_attribute("data-testid") or ""
-            tab = btn.get_attribute("data-tab") or ""
-            visible = btn.is_displayed()
-            print(f"  button: aria='{aria}' testid='{testid}' tab='{tab}' visible={visible}")
-        except Exception:
-            pass
-
-    # Ищем все span с data-icon
-    all_icons = driver.find_elements(By.CSS_SELECTOR, "span[data-icon]")
-    print(f"[WA] Найдено иконок: {len(all_icons)}")
-    for icon in all_icons:
-        try:
-            icon_name = icon.get_attribute("data-icon") or ""
-            visible = icon.is_displayed()
-            print(f"  icon: data-icon='{icon_name}' visible={visible}")
-        except Exception:
-            pass
-
-    # Попытка 1: кнопка отправки по всем возможным селекторам
-    send_selectors_css = [
-        "button[data-testid='compose-btn-send']",
-        "span[data-testid='send']",
-        "span[data-icon='send']",
-        "button[aria-label='Send']",
-        "button[aria-label='Отправить']",
-        "button[data-tab='11']",
+def find_composer():
+    """Ищет поле ввода сообщения в открытом чате."""
+    selectors = [
+        "footer div[contenteditable='true'][role='textbox']",
+        "footer div[contenteditable='true']",
+        "div[contenteditable='true'][role='textbox']",
     ]
-
-    for sel in send_selectors_css:
+    for sel in selectors:
         try:
             elements = driver.find_elements(By.CSS_SELECTOR, sel)
             for el in elements:
                 if el.is_displayed():
-                    driver.execute_script("arguments[0].click();", el)
-                    print(f"[WA] ✅ Клик по: {sel}")
-                    time.sleep(2)
-                    png2 = driver.get_screenshot_as_png()
-                    send_to_telegram(f"✅ Клик по {sel}", png2)
-                    return
+                    return el
+        except Exception:
+            pass
+    return None
+
+
+def wait_for_composer(timeout=20):
+    """Ждём появления поля ввода в открытом чате."""
+    end_time = time.time() + timeout
+    while time.time() < end_time:
+        close_blocking_popups()
+        click_continue_screens()
+
+        composer = find_composer()
+        if composer:
+            return composer
+
+        time.sleep(1)
+    return None
+
+
+def open_draft_chat(phone: str):
+    """Если WhatsApp создал черновик — кликаем по чату слева."""
+    phone_tail = re.sub(r"\D", "", phone)[-10:]
+
+    try:
+        rows = driver.find_elements(
+            By.CSS_SELECTOR,
+            "#pane-side [role='listitem'], "
+            "#pane-side [data-testid='cell-frame-container']"
+        )
+    except Exception:
+        rows = []
+
+    print(f"[WA] Найдено строк чатов слева: {len(rows)}")
+
+    for row in rows:
+        try:
+            if not row.is_displayed():
+                continue
+
+            txt = (row.text or "").strip().lower()
+            digits = re.sub(r"\D", "", txt)
+
+            if phone_tail and phone_tail in digits:
+                print(f"[WA] Нашёл чат по номеру: {txt[:80]}")
+                click_visible(row)
+                time.sleep(2)
+                return True
+
+            if "черновик" in txt or "draft" in txt:
+                print(f"[WA] Нашёл чат с черновиком: {txt[:80]}")
+                click_visible(row)
+                time.sleep(2)
+                return True
         except Exception:
             pass
 
-    # Попытка 2: найти data-icon='send' и кликнуть на родителя
+    # Fallback: кликнуть по первому чату в списке
     try:
-        send_icons = driver.find_elements(By.CSS_SELECTOR, "span[data-icon='send']")
-        for icon in send_icons:
-            if icon.is_displayed():
-                parent = icon.find_element(By.XPATH, "./ancestor::button")
-                driver.execute_script("arguments[0].click();", parent)
-                print("[WA] ✅ Клик по parent button от data-icon='send'")
+        if rows:
+            first_visible = None
+            for r in rows:
+                if r.is_displayed():
+                    first_visible = r
+                    break
+            if first_visible:
+                print("[WA] Fallback: кликаю по первому видимому чату")
+                click_visible(first_visible)
                 time.sleep(2)
-                return
-    except Exception as e:
-        print(f"[WA] ancestor::button не найден: {e}")
-
-    # Попытка 3: кликнуть по самой иконке send
-    try:
-        send_icons = driver.find_elements(By.CSS_SELECTOR, "span[data-icon='send']")
-        for icon in send_icons:
-            if icon.is_displayed():
-                driver.execute_script("arguments[0].click();", icon)
-                print("[WA] ✅ Клик по span[data-icon='send']")
-                time.sleep(2)
-                return
+                return True
     except Exception:
         pass
 
-    # Попытка 4: JavaScript клик по координатам кнопки
-    try:
-        driver.execute_script("""
-            var btns = document.querySelectorAll('span[data-icon="send"]');
-            if (btns.length > 0) {
-                btns[0].closest('button').click();
-                return true;
-            }
-            return false;
-        """)
-        print("[WA] ✅ JS клик по send")
-        time.sleep(2)
-        png3 = driver.get_screenshot_as_png()
-        send_to_telegram("✅ JS клик по send", png3)
-        return
-    except Exception:
-        pass
+    return False
 
-    # Попытка 5: ActionChains на поле ввода + Enter
-    try:
-        input_selectors = [
-            "div[contenteditable='true'][data-tab='10']",
-            "div[contenteditable='true'][data-tab='1']",
-            "footer div[contenteditable='true']",
-            "div[role='textbox']",
-            "div[contenteditable='true']",
+
+def click_send_button(timeout=15):
+    """Ищет и нажимает кнопку отправки в футере чата."""
+    end_time = time.time() + timeout
+
+    while time.time() < end_time:
+        close_blocking_popups()
+
+        # 1. Селекторы внутри footer
+        selectors = [
+            "footer button[aria-label='Send']",
+            "footer button[aria-label='Отправить']",
+            "footer [data-testid='compose-btn-send']",
+            "footer button[data-testid='compose-btn-send']",
+            "footer span[data-testid='send']",
+            "footer span[data-icon='send']",
         ]
-        for sel in input_selectors:
+
+        for sel in selectors:
             try:
-                inp = driver.find_element(By.CSS_SELECTOR, sel)
-                if inp.is_displayed():
-                    inp.click()
-                    time.sleep(0.5)
-                    actions = ActionChains(driver)
-                    actions.send_keys(Keys.ENTER)
-                    actions.perform()
-                    print(f"[WA] ✅ ActionChains Enter на: {sel}")
+                elements = driver.find_elements(By.CSS_SELECTOR, sel)
+                for el in elements:
+                    if not el.is_displayed():
+                        continue
+                    # Пробуем кликнуть по parent button
+                    try:
+                        parent_btn = el.find_element(
+                            By.XPATH,
+                            "./ancestor::button[1] | ./ancestor::*[@role='button'][1]"
+                        )
+                        if parent_btn.is_displayed():
+                            click_visible(parent_btn)
+                            print(f"[WA] ✅ Send через parent: {sel}")
+                            time.sleep(2)
+                            return True
+                    except Exception:
+                        pass
+
+                    click_visible(el)
+                    print(f"[WA] ✅ Send напрямую: {sel}")
                     time.sleep(2)
-                    png4 = driver.get_screenshot_as_png()
-                    send_to_telegram(f"✅ Enter на {sel}", png4)
-                    return
+                    return True
             except Exception:
-                continue
-    except Exception:
-        pass
+                pass
 
-    # Ничего не сработало
-    png_final = driver.get_screenshot_as_png()
-    send_to_telegram("❌ Ни один метод отправки не сработал. Скриншот:", png_final)
+        # 2. Без footer — глобальный поиск
+        global_selectors = [
+            "button[data-testid='compose-btn-send']",
+            "span[data-testid='send']",
+            "span[data-icon='send']",
+            "button[aria-label='Send']",
+            "button[aria-label='Отправить']",
+        ]
 
-    # Дамп HTML для анализа
+        for sel in global_selectors:
+            try:
+                elements = driver.find_elements(By.CSS_SELECTOR, sel)
+                for el in elements:
+                    if not el.is_displayed():
+                        continue
+                    try:
+                        parent_btn = el.find_element(
+                            By.XPATH,
+                            "./ancestor::button[1] | ./ancestor::*[@role='button'][1]"
+                        )
+                        if parent_btn.is_displayed():
+                            click_visible(parent_btn)
+                            print(f"[WA] ✅ Global send через parent: {sel}")
+                            time.sleep(2)
+                            return True
+                    except Exception:
+                        pass
+
+                    click_visible(el)
+                    print(f"[WA] ✅ Global send: {sel}")
+                    time.sleep(2)
+                    return True
+            except Exception:
+                pass
+
+        # 3. JS fallback
+        try:
+            result = driver.execute_script("""
+                var icons = document.querySelectorAll('span[data-icon="send"]');
+                for (var i = 0; i < icons.length; i++) {
+                    var btn = icons[i].closest('button');
+                    if (btn && btn.offsetParent !== null) {
+                        btn.click();
+                        return true;
+                    }
+                }
+                return false;
+            """)
+            if result:
+                print("[WA] ✅ JS клик по send")
+                time.sleep(2)
+                return True
+        except Exception:
+            pass
+
+        # 4. Последняя кнопка в footer
+        try:
+            footer = driver.find_element(By.TAG_NAME, "footer")
+            btns = footer.find_elements(By.CSS_SELECTOR, "button, [role='button']")
+            visible_btns = [b for b in btns if b.is_displayed()]
+            if visible_btns:
+                last_btn = visible_btns[-1]
+                click_visible(last_btn)
+                print("[WA] ✅ Последняя кнопка в footer")
+                time.sleep(2)
+                return True
+        except Exception:
+            pass
+
+        time.sleep(1)
+
+    return False
+
+
+# ==================== SEND MESSAGE ====================
+
+def send_whatsapp(phone: str, text: str):
+    """Отправка сообщения через WhatsApp Web."""
+    phone = re.sub(r"\D", "", phone)
+    url = (
+        f"https://web.whatsapp.com/send"
+        f"?phone={phone}"
+        f"&text={quote(text)}"
+        f"&type=phone_number"
+        f"&app_absent=0"
+    )
+
+    print(f"[WA] Открываю URL: {url}")
+    driver.get(url)
+
+    # Даём странице загрузиться
+    time.sleep(8)
+    close_blocking_popups()
+    click_continue_screens()
+    time.sleep(2)
+
+    # Проверка на ошибку номера
+    page_source = driver.page_source.lower()
+    if "phone number shared via url is invalid" in page_source:
+        raise Exception(f"Номер {phone} не найден в WhatsApp")
+
+    # Скриншот для отладки
+    png_step1 = driver.get_screenshot_as_png()
+    send_to_telegram("🔍 Шаг 1: после загрузки URL", png_step1)
+
+    # Ждём открытия чата (поле ввода справа)
+    composer = wait_for_composer(timeout=10)
+
+    # Если чат не открылся — пробуем кликнуть по черновику слева
+    if not composer:
+        print("[WA] Чат справа не открылся, ищу черновик слева...")
+        png_step2 = driver.get_screenshot_as_png()
+        send_to_telegram("🔍 Шаг 2: чат не открылся, ищу черновик", png_step2)
+
+        opened = open_draft_chat(phone)
+        if opened:
+            time.sleep(2)
+            close_blocking_popups()
+            composer = wait_for_composer(timeout=10)
+
+    # Если всё ещё нет — сдаёмся
+    if not composer:
+        png_fail = driver.get_screenshot_as_png()
+        send_to_telegram("❌ Чат не открылся. Скриншот:", png_fail)
+        raise Exception("Чат не открылся для отправки")
+
+    print("[WA] ✅ Поле ввода найдено")
+    png_step3 = driver.get_screenshot_as_png()
+    send_to_telegram("🔍 Шаг 3: поле ввода найдено", png_step3)
+
+    # Нажимаем кнопку отправки
+    sent = click_send_button(timeout=15)
+    if sent:
+        print("[WA] ✅ Сообщение отправлено!")
+        return
+
+    # Fallback: фокус на composer + Enter
+    print("[WA] Кнопка send не найдена, пробую Enter...")
     try:
-        html = driver.page_source[:3000]
-        send_to_telegram(f"📄 HTML (первые 3000 символов):\n{html}")
-    except Exception:
-        pass
+        click_visible(composer)
+        time.sleep(1)
+        composer.send_keys(Keys.ENTER)
+        print("[WA] ⚠️ Fallback: Enter в composer")
+        time.sleep(2)
 
-    raise Exception("Не удалось отправить: ни одна кнопка/метод не сработали")
+        png_step4 = driver.get_screenshot_as_png()
+        send_to_telegram("🔍 Шаг 4: после Enter", png_step4)
+        return
+    except Exception as e:
+        print(f"[WA] Enter тоже не сработал: {e}")
 
+    png_final = driver.get_screenshot_as_png()
+    send_to_telegram("❌ Не удалось отправить. Скриншот:", png_final)
+    raise Exception("Не удалось отправить сообщение")
+
+
+# ==================== TELEGRAM HANDLERS ====================
 
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != OWNER_ID:
@@ -438,7 +621,6 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def debug_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Отправляет скриншот текущего состояния браузера."""
     if update.effective_user.id != OWNER_ID:
         return
     if not driver:
@@ -453,7 +635,6 @@ async def debug_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def restart_wa_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Перезапуск WhatsApp сессии."""
     if update.effective_user.id != OWNER_ID:
         return
     global driver, wa_ready
@@ -489,6 +670,8 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         await update.message.reply_text(f"❌ Ошибка: {e}")
 
+
+# ==================== MAIN ====================
 
 def main():
     global bot_app, main_loop
