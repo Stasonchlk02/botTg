@@ -1,7 +1,6 @@
 import asyncio
 import os
 import re
-import threading
 import time
 import base64
 from urllib.parse import quote
@@ -39,12 +38,11 @@ def start_whatsapp():
     service = Service("/usr/bin/chromedriver")
     driver = webdriver.Chrome(service=service, options=options)
     driver.get("https://web.whatsapp.com")
+    print("WhatsApp Web загружен, ожидание авторизации...")
 
-    # Ждём 90 секунд, ищем QR и выводим его в консоль
     for attempt in range(30):
         time.sleep(3)
         try:
-            # Уже авторизован?
             WebDriverWait(driver, 2).until(
                 EC.presence_of_element_located((By.CSS_SELECTOR, "div[data-testid='chat-list']"))
             )
@@ -54,25 +52,18 @@ def start_whatsapp():
         except:
             pass
 
-        # Пытаемся найти QR-код
         try:
             qr = driver.find_element(By.CSS_SELECTOR, "canvas[aria-label='QR code']")
-            # Делаем скриншот и конвертируем в base64
             png = driver.get_screenshot_as_png()
-            b64 = base64.b64encode(png).decode('utf-8')
-            print("\n" + "="*50)
-            print("📱 ОТСКАНИРУЙТЕ QR-КОД В WHATSAPP")
-            print("Скопируйте следующую строку и декодируйте её на сайте:")
-            print("https://base64.guru/converter/decode/image/png")
+            b64 = base64.b64encode(png).decode()
+            print("\n===== QR-код в base64 =====")
             print(b64)
-            print("="*50 + "\n")
-            # Ждём 30 секунд после показа QR
-            time.sleep(30)
+            print("===== Скопируйте строку и декодируйте ====\n")
+            time.sleep(20)
         except:
             pass
 
-    wa_ready = False
-    print("❌ WhatsApp не авторизован после 90 секунд")
+    print("❌ WhatsApp не авторизован")
 
 def send_whatsapp(phone: str, text: str):
     phone = re.sub(r"\D", "", phone)
@@ -111,45 +102,56 @@ def send_whatsapp(phone: str, text: str):
 
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != OWNER_ID:
+        await update.message.reply_text("Нет доступа")
         return
     await update.message.reply_text(
-        "Формат: +79151234567 Текст\n"
-        f"WhatsApp: {'✅ готов' if wa_ready else '⏳ ожидает QR'}"
+        f"Статус WhatsApp: {'✅ готов' if wa_ready else '⏳ ожидает QR'}\n"
+        "Формат: +79151234567 Текст"
     )
 
 async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != OWNER_ID:
         return
     if not wa_ready:
-        await update.message.reply_text("⏳ WhatsApp ещё не готов, загляни в логи Railway для QR")
+        await update.message.reply_text("⏳ WhatsApp не готов, QR-код в логах Railway")
         return
     text = update.message.text.strip()
     match = re.match(r"^(\+\d{10,15})\s+(.+)$", text, re.S)
     if not match:
-        await update.message.reply_text("❌ Формат: +79151234567 Текст")
+        await update.message.reply_text("Формат: +79151234567 Текст")
         return
     phone, message = match.groups()
-    await update.message.reply_text(f"📤 Отправляю на {phone}...")
+    await update.message.reply_text(f"Отправляю на {phone}...")
     try:
         loop = asyncio.get_running_loop()
         await loop.run_in_executor(None, send_whatsapp, phone, message)
         await update.message.reply_text("✅ Отправлено")
     except Exception as e:
-        await update.message.reply_text(f"❌ {e}")
+        await update.message.reply_text(f"Ошибка: {e}")
 
 async def on_startup(app):
+    import threading
     threading.Thread(target=start_whatsapp, daemon=True).start()
 
 def main():
     if not TOKEN:
         print("❌ Нет TELEGRAM_TOKEN")
         return
+
     import requests
+    # Сброс вебхука с принудительным удалением ожидающих обновлений
     requests.get(f"https://api.telegram.org/bot{TOKEN}/deleteWebhook?drop_pending_updates=True")
+    print("Вебхук сброшен")
+
     app = Application.builder().token(TOKEN).build()
     app.add_handler(CommandHandler("start", start_cmd))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
-    asyncio.get_event_loop().run_until_complete(on_startup(app))
+
+    # Запускаем поток для WhatsApp
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    loop.run_until_complete(on_startup(app))
+
     print("🚀 Бот запущен")
     app.run_polling(drop_pending_updates=True)
 
