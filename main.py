@@ -15,160 +15,150 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 
-TOKEN = os.getenv("TELEGRAM_TOKEN")
+# ========== КОНФИГУРАЦИЯ ==========
+TOKEN = os.getenv("TELEGRAM_TOKEN")          # Обязательно задать в Railway Variables
 OWNER_ID = int(os.getenv("OWNER_ID", "1636373767"))
 SESSION_DIR = os.path.join(os.getcwd(), "chrome_session")
 
 driver = None
 wa_ready = False
-application = None  # для доступа к боту из потоков
+application = None   # для доступа к боту из потока
 
-
+# ========== ИНИЦИАЛИЗАЦИЯ WHATSAPP ==========
 def start_whatsapp():
     global driver, wa_ready, application
 
     options = Options()
     options.add_argument(f"--user-data-dir={SESSION_DIR}")
     options.add_argument("--profile-directory=Default")
-
-    # Для Railway (без экрана)
-    options.add_argument("--headless=new")
+    options.add_argument("--headless=new")          # без GUI
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
     options.add_argument("--disable-gpu")
     options.add_argument("--window-size=1920,1080")
-    
-    # Пути для Railway
-    options.binary_location = "/usr/bin/chromium"
+    options.binary_location = "/usr/bin/chromium"   # путь к браузеру в Railway
+
+    # ChromeDriver тоже ставится через chromium-driver в Railway
     service = Service("/usr/bin/chromedriver")
 
     driver = webdriver.Chrome(service=service, options=options)
     driver.get("https://web.whatsapp.com")
 
-    # Ждём загрузки и отправляем QR если нужно
-    for _ in range(20):  # ждём до 60 секунд
+    # Пытаемся дождаться входа и, если нужно, отправить QR в Telegram
+    for _ in range(30):   # максимум 90 секунд ожидания
         time.sleep(3)
         try:
-            # Проверяем готов ли WhatsApp
+            # Если чат-лист загрузился – вход выполнен
             WebDriverWait(driver, 2).until(
                 EC.presence_of_element_located((By.CSS_SELECTOR, "div[data-testid='chat-list']"))
             )
             wa_ready = True
             print("✅ WhatsApp готов")
-            
-            # Отправляем уведомление владельцу
             if application:
                 asyncio.run_coroutine_threadsafe(
-                    application.bot.send_message(OWNER_ID, "✅ WhatsApp Web готов к работе!"),
+                    application.bot.send_message(OWNER_ID, "✅ WhatsApp Web успешно авторизован!"),
                     asyncio.get_event_loop()
                 )
             return
         except:
             pass
-        
-        # Если не готов - возможно нужен QR
+
+        # Если не готов – возможно, висит QR‑код
         try:
-            qr_element = driver.find_element(By.CSS_SELECTOR, "canvas[aria-label='QR code']")
-            if qr_element:
-                print("📱 QR код обнаружен, сохраняем...")
-                driver.save_screenshot("qr.png")
-                print("📱 QR сохранён как qr.png")
-                
-                # Отправляем QR в Telegram
+            qr_canvas = driver.find_element(By.CSS_SELECTOR, "canvas[aria-label='QR code']")
+            if qr_canvas:
+                print("📱 QR-код обнаружен, сохраняем скриншот...")
+                driver.save_screenshot("/tmp/qr.png")
                 if application:
-                    with open("qr.png", "rb") as f:
+                    with open("/tmp/qr.png", "rb") as f:
                         asyncio.run_coroutine_threadsafe(
-                            application.bot.send_photo(OWNER_ID, photo=f, caption="Отсканируй QR код в WhatsApp"),
+                            application.bot.send_photo(OWNER_ID, f, caption="🔐 Отсканируйте QR-код в WhatsApp Web"),
                             asyncio.get_event_loop()
                         )
-                # Ждём сканирования
+                # Ждём 20 секунд, чтобы пользователь успел отсканировать
                 time.sleep(20)
         except:
-            pass
-    
-    wa_ready = True  # если ничего не получилось - всё равно работаем
-    print("⚠️ WhatsApp статус не определён")
+            continue
 
+    # Если за 90 секунд так и не вошли – продолжаем (но, возможно, проблемы)
+    wa_ready = True
+    print("⚠️ Статус WhatsApp не определён, но бот продолжает работу")
+
+# ========== ОТПРАВКА СООБЩЕНИЯ (улучшенная) ==========
 def send_whatsapp(phone: str, text: str):
     phone = re.sub(r"\D", "", phone)
     url = f"https://web.whatsapp.com/send?phone={phone}&text={quote(text)}"
     driver.get(url)
-    
-    # Ждём загрузки чата
+
     try:
-        # Сначала убедимся, что поле ввода появилось
+        # Ждём появления поля ввода
         input_box = WebDriverWait(driver, 30).until(
             EC.presence_of_element_located((By.CSS_SELECTOR, "div[contenteditable='true']"))
         )
-        time.sleep(2)  # Даём WhatsApp проинициализировать кнопку
-        
-        # Способ 1: Enter
+        time.sleep(2)   # даём WhatsApp активировать кнопку
+
+        # ----- Способ 1: Enter -----
         input_box.send_keys("\n")
         time.sleep(2)
-        # Проверяем, очистилось ли поле (сообщение ушло)
         if input_box.text.strip() == "":
             return
-        
-        # Способ 2: ищем кнопку отправки
-        send_btns = [
+
+        # ----- Способ 2: поиск кнопки отправки -----
+        send_selectors = [
             "button[aria-label='Отправить']",
             "button[aria-label='Send']",
             "span[data-testid='send']",
             "span[data-icon='send']",
             "div[data-testid='send']",
-            "button[data-testid='compose-btn-send']",
-            "div[role='button'][aria-label='Send']"
+            "button[data-testid='compose-btn-send']"
         ]
-        for selector in send_btns:
+        for selector in send_selectors:
             try:
-                btn = WebDriverWait(driver, 3).until(
+                send_btn = WebDriverWait(driver, 3).until(
                     EC.element_to_be_clickable((By.CSS_SELECTOR, selector))
                 )
-                driver.execute_script("arguments[0].click();", btn)
+                driver.execute_script("arguments[0].click();", send_btn)
                 time.sleep(2)
                 return
             except:
                 continue
-        
-        # Способ 3: кликнуть по полю, ещё раз Enter
+
+        # ----- Способ 3: клик по полю + Enter -----
         input_box.click()
         input_box.send_keys("\n")
         time.sleep(2)
         if input_box.text.strip() == "":
             return
-        
-        raise Exception("Ни один способ отправки не сработал")
-        
+
+        raise Exception("Не удалось отправить сообщение (кнопка не найдена, Enter не сработал)")
+
     except Exception as e:
-        raise Exception(f"Не удалось отправить: {e}")
+        raise Exception(f"Ошибка при отправке: {e}")
+
+# ========== КОМАНДЫ ТЕЛЕГРАМ ==========
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != OWNER_ID:
-        await update.message.reply_text("❌ Нет доступа")
+        await update.message.reply_text("❌ Доступ запрещён")
         return
-
     await update.message.reply_text(
         "🤖 Бот готов!\n\n"
         "Отправь сообщение в формате:\n"
         "+79151234567 Текст сообщения\n\n"
-        f"WhatsApp статус: {'✅ Готов' if wa_ready else '⏳ Загружается...'}"
+        f"Статус WhatsApp: {'✅ Готов' if wa_ready else '⏳ Загружается...'}"
     )
-
 
 async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != OWNER_ID:
         return
 
     if not wa_ready:
-        await update.message.reply_text(
-            "⏳ WhatsApp ещё не готов. Подожди 20 секунд..."
-        )
+        await update.message.reply_text("⏳ WhatsApp ещё не готов, подожди 10–20 секунд...")
         return
 
     text = update.message.text.strip()
     match = re.match(r"^(\+\d{10,15})\s+(.+)$", text, re.S)
-
     if not match:
-        await update.message.reply_text("❌ Формат: +79151234567 Текст сообщения")
+        await update.message.reply_text("❌ Неверный формат. Используй: +79151234567 Текст")
         return
 
     phone, message = match.groups()
@@ -177,37 +167,44 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         loop = asyncio.get_running_loop()
         await loop.run_in_executor(None, send_whatsapp, phone, message)
-        await update.message.reply_text("✅ Отправлено!")
+        await update.message.reply_text("✅ Отправлено успешно!")
     except Exception as e:
         await update.message.reply_text(f"❌ Ошибка: {e}")
 
-
+# ========== ЗАПУСК ==========
 async def on_startup(app: Application):
     global application
     application = app
-    print("🚀 Запускаю WhatsApp Web...")
+    print("🚀 Запускаем WhatsApp Web...")
     threading.Thread(target=start_whatsapp, daemon=True).start()
-
 
 def main():
     global application
-    
+
     if not TOKEN:
-        print("❌ Ошибка: TELEGRAM_TOKEN не задан в переменных окружения")
+        print("❌ Ошибка: переменная TELEGRAM_TOKEN не установлена!")
         return
-    
+
+    # Принудительно сбрасываем вебхук, чтобы избежать конфликта getUpdates
+    import requests
+    try:
+        requests.get(f"https://api.telegram.org/bot{TOKEN}/deleteWebhook?drop_pending_updates=True")
+        print("✅ Вебхук сброшен")
+    except Exception as e:
+        print(f"⚠️ Не удалось сбросить вебхук: {e}")
+
     app = Application.builder().token(TOKEN).build()
     application = app
-    
+
     app.add_handler(CommandHandler("start", start_cmd))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
-    
-    # Запускаем инициализацию при старте
-    asyncio.get_event_loop().run_until_complete(on_startup(app))
-    
-    print("🚀 Бот запущен")
-    app.run_polling()
 
+    # Инициализация WhatsApp (асинхронная)
+    asyncio.get_event_loop().run_until_complete(on_startup(app))
+
+    print("🚀 Бот запущен и слушает сообщения")
+    time.sleep(5)   # небольшая пауза, чтобы старый процесс успел завершиться
+    app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
     main()
