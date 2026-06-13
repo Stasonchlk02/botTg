@@ -14,57 +14,80 @@ from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
-from webdriver_manager.chrome import ChromeDriverManager
 
-
-TOKEN = "8827507215:AAGCzPvre3sPFu4wcfR80EMANm-gAgRONlQ"
-OWNER_ID = 1636373767
+TOKEN = os.getenv("TELEGRAM_TOKEN")
+OWNER_ID = int(os.getenv("OWNER_ID", "1636373767"))
 SESSION_DIR = os.path.join(os.getcwd(), "chrome_session")
 
 driver = None
 wa_ready = False
+application = None  # для доступа к боту из потоков
 
 
 def start_whatsapp():
-    global driver, wa_ready
+    global driver, wa_ready, application
 
     options = Options()
     options.add_argument(f"--user-data-dir={SESSION_DIR}")
     options.add_argument("--profile-directory=Default")
 
-    # Эти строки нужны для Railway (сервер без экрана)
+    # Для Railway (без экрана)
     options.add_argument("--headless=new")
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
     options.add_argument("--disable-gpu")
     options.add_argument("--window-size=1920,1080")
-    options.binary_location = "/usr/bin/chromium"   # путь к браузеру
+    
+    # Пути для Railway
+    options.binary_location = "/usr/bin/chromium"
+    service = Service("/usr/bin/chromedriver")
 
-    service = Service("/usr/bin/chromedriver")      # путь к драйверу
-    driver = webdriver.Chrome(
-        service=Service(ChromeDriverManager().install()),
-        options=options
-    )
+    driver = webdriver.Chrome(service=service, options=options)
     driver.get("https://web.whatsapp.com")
 
-    while True:
+    # Ждём загрузки и отправляем QR если нужно
+    for _ in range(20):  # ждём до 60 секунд
+        time.sleep(3)
         try:
-            WebDriverWait(driver, 30).until(
-    EC.presence_of_element_located((By.CSS_SELECTOR, "canvas[aria-label='QR code']"))
-)
-# Скриншот
-driver.save_screenshot("qr.png")
-# Отправить через бота (нужен доступ к application.bot)
-await application.bot.send_photo(OWNER_ID, photo=open("qr.png", "rb"))
-            WebDriverWait(driver, 5).until(
+            # Проверяем готов ли WhatsApp
+            WebDriverWait(driver, 2).until(
                 EC.presence_of_element_located((By.CSS_SELECTOR, "div[data-testid='chat-list']"))
             )
             wa_ready = True
             print("✅ WhatsApp готов")
+            
+            # Отправляем уведомление владельцу
+            if application:
+                asyncio.run_coroutine_threadsafe(
+                    application.bot.send_message(OWNER_ID, "✅ WhatsApp Web готов к работе!"),
+                    asyncio.get_event_loop()
+                )
             return
-        except Exception:
-            wa_ready = False
-            time.sleep(3)
+        except:
+            pass
+        
+        # Если не готов - возможно нужен QR
+        try:
+            qr_element = driver.find_element(By.CSS_SELECTOR, "canvas[aria-label='QR code']")
+            if qr_element:
+                print("📱 QR код обнаружен, сохраняем...")
+                driver.save_screenshot("qr.png")
+                print("📱 QR сохранён как qr.png")
+                
+                # Отправляем QR в Telegram
+                if application:
+                    with open("qr.png", "rb") as f:
+                        asyncio.run_coroutine_threadsafe(
+                            application.bot.send_photo(OWNER_ID, photo=f, caption="Отсканируй QR код в WhatsApp"),
+                            asyncio.get_event_loop()
+                        )
+                # Ждём сканирования
+                time.sleep(20)
+        except:
+            pass
+    
+    wa_ready = True  # если ничего не получилось - всё равно работаем
+    print("⚠️ WhatsApp статус не определён")
 
 def send_whatsapp(phone: str, text: str):
     phone = re.sub(r"\D", "", phone)
@@ -85,7 +108,7 @@ def send_whatsapp(phone: str, text: str):
             )
             driver.execute_script("arguments[0].click();", btn)
             time.sleep(2)
-            return
+            return True
         except Exception:
             pass
 
@@ -94,11 +117,14 @@ def send_whatsapp(phone: str, text: str):
 
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != OWNER_ID:
+        await update.message.reply_text("❌ Нет доступа")
         return
 
     await update.message.reply_text(
-        "Отправь сообщение так:\n"
-        "+79151234567 Привет"
+        "🤖 Бот готов!\n\n"
+        "Отправь сообщение в формате:\n"
+        "+79151234567 Текст сообщения\n\n"
+        f"WhatsApp статус: {'✅ Готов' if wa_ready else '⏳ Загружается...'}"
     )
 
 
@@ -108,8 +134,7 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if not wa_ready:
         await update.message.reply_text(
-            "WhatsApp ещё не готов.\n"
-            "Если это первый запуск — открой Chrome и отсканируй QR."
+            "⏳ WhatsApp ещё не готов. Подожди 20 секунд..."
         )
         return
 
@@ -117,7 +142,7 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     match = re.match(r"^(\+\d{10,15})\s+(.+)$", text, re.S)
 
     if not match:
-        await update.message.reply_text("Формат:\n+79151234567 Привет")
+        await update.message.reply_text("❌ Формат: +79151234567 Текст сообщения")
         return
 
     phone, message = match.groups()
@@ -126,22 +151,34 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         loop = asyncio.get_running_loop()
         await loop.run_in_executor(None, send_whatsapp, phone, message)
-        await update.message.reply_text("✅ Отправлено")
+        await update.message.reply_text("✅ Отправлено!")
     except Exception as e:
         await update.message.reply_text(f"❌ Ошибка: {e}")
 
 
 async def on_startup(app: Application):
+    global application
+    application = app
+    print("🚀 Запускаю WhatsApp Web...")
     threading.Thread(target=start_whatsapp, daemon=True).start()
 
 
 def main():
+    global application
+    
+    if not TOKEN:
+        print("❌ Ошибка: TELEGRAM_TOKEN не задан в переменных окружения")
+        return
+    
     app = Application.builder().token(TOKEN).build()
-    app.post_init = on_startup
-
+    application = app
+    
     app.add_handler(CommandHandler("start", start_cmd))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
-
+    
+    # Запускаем инициализацию при старте
+    asyncio.get_event_loop().run_until_complete(on_startup(app))
+    
     print("🚀 Бот запущен")
     app.run_polling()
 
