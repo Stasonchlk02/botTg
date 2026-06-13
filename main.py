@@ -49,6 +49,13 @@ def start_whatsapp():
 
     while True:
         try:
+            WebDriverWait(driver, 30).until(
+    EC.presence_of_element_located((By.CSS_SELECTOR, "canvas[aria-label='QR code']"))
+)
+# Скриншот
+driver.save_screenshot("qr.png")
+# Отправить через бота (нужен доступ к application.bot)
+await application.bot.send_photo(OWNER_ID, photo=open("qr.png", "rb"))
             WebDriverWait(driver, 5).until(
                 EC.presence_of_element_located((By.CSS_SELECTOR, "div[data-testid='chat-list']"))
             )
