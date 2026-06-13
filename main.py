@@ -93,28 +93,54 @@ def send_whatsapp(phone: str, text: str):
     phone = re.sub(r"\D", "", phone)
     url = f"https://web.whatsapp.com/send?phone={phone}&text={quote(text)}"
     driver.get(url)
-
-    selectors = [
-        "button[aria-label='Отправить']",
-        "button[aria-label='Send']",
-        "span[data-testid='send']",
-        "span[data-icon='send']",
-    ]
-
-    for selector in selectors:
-        try:
-            btn = WebDriverWait(driver, 15).until(
-                EC.presence_of_element_located((By.CSS_SELECTOR, selector))
-            )
-            driver.execute_script("arguments[0].click();", btn)
-            time.sleep(2)
-            return True
-        except Exception:
-            pass
-
-    raise Exception("Не найдена кнопка отправки")
-
-
+    
+    # Ждём загрузки чата
+    try:
+        # Сначала убедимся, что поле ввода появилось
+        input_box = WebDriverWait(driver, 30).until(
+            EC.presence_of_element_located((By.CSS_SELECTOR, "div[contenteditable='true']"))
+        )
+        time.sleep(2)  # Даём WhatsApp проинициализировать кнопку
+        
+        # Способ 1: Enter
+        input_box.send_keys("\n")
+        time.sleep(2)
+        # Проверяем, очистилось ли поле (сообщение ушло)
+        if input_box.text.strip() == "":
+            return
+        
+        # Способ 2: ищем кнопку отправки
+        send_btns = [
+            "button[aria-label='Отправить']",
+            "button[aria-label='Send']",
+            "span[data-testid='send']",
+            "span[data-icon='send']",
+            "div[data-testid='send']",
+            "button[data-testid='compose-btn-send']",
+            "div[role='button'][aria-label='Send']"
+        ]
+        for selector in send_btns:
+            try:
+                btn = WebDriverWait(driver, 3).until(
+                    EC.element_to_be_clickable((By.CSS_SELECTOR, selector))
+                )
+                driver.execute_script("arguments[0].click();", btn)
+                time.sleep(2)
+                return
+            except:
+                continue
+        
+        # Способ 3: кликнуть по полю, ещё раз Enter
+        input_box.click()
+        input_box.send_keys("\n")
+        time.sleep(2)
+        if input_box.text.strip() == "":
+            return
+        
+        raise Exception("Ни один способ отправки не сработал")
+        
+    except Exception as e:
+        raise Exception(f"Не удалось отправить: {e}")
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != OWNER_ID:
         await update.message.reply_text("❌ Нет доступа")
