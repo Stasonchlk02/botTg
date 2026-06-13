@@ -36,7 +36,7 @@ def start_whatsapp():
     options.binary_location = "/usr/bin/google-chrome"
 
     service = Service("/usr/bin/chromedriver")
-    driver = webdriver.Chrome(service=service, options=options)
+    driver = webdriver.Chrome(options=options)
     driver.get("https://web.whatsapp.com")
     print("WhatsApp Web загружен, делаем скриншоты каждые 10 секунд...")
 
