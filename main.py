@@ -38,11 +38,22 @@ def start_whatsapp():
     service = Service("/usr/bin/chromedriver")
     driver = webdriver.Chrome(service=service, options=options)
     driver.get("https://web.whatsapp.com")
-    print("WhatsApp Web загружен, ожидание авторизации...")
+    print("WhatsApp Web загружен, делаем скриншоты каждые 10 секунд...")
 
-    for attempt in range(30):
-        time.sleep(3)
+    for attempt in range(30):  # 5 минут
+        time.sleep(10)
+        # Делаем скриншот всей страницы
+        png = driver.get_screenshot_as_png()
+        b64 = base64.b64encode(png).decode('utf-8')
+        print(f"\n===== Скриншот {attempt+1} (base64) =====")
+        # Выводим первые 100 символов для информации, а полный вывод - по желанию
+        # Чтобы не засорять логи, выводим сокращённо, но можно вывести полностью
+        # Для диагностики нужно полное изображение, поэтому выводим весь base64
+        print(b64)
+        print("===== Конец скриншота =====\n")
+
         try:
+            # Проверяем наличие чатов
             WebDriverWait(driver, 2).until(
                 EC.presence_of_element_located((By.CSS_SELECTOR, "div[data-testid='chat-list']"))
             )
@@ -53,13 +64,9 @@ def start_whatsapp():
             pass
 
         try:
-            qr = driver.find_element(By.CSS_SELECTOR, "canvas[aria-label='QR code']")
-            png = driver.get_screenshot_as_png()
-            b64 = base64.b64encode(png).decode()
-            print("\n===== QR-код в base64 =====")
-            print(b64)
-            print("===== Скопируйте строку и декодируйте ====\n")
-            time.sleep(20)
+            # Проверяем наличие QR
+            driver.find_element(By.CSS_SELECTOR, "canvas[aria-label='QR code']")
+            print("QR код обнаружен на странице")
         except:
             pass
 
@@ -105,7 +112,7 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Нет доступа")
         return
     await update.message.reply_text(
-        f"Статус WhatsApp: {'✅ готов' if wa_ready else '⏳ ожидает QR'}\n"
+        f"Статус WhatsApp: {'✅ готов' if wa_ready else '⏳ ожидает QR (смотри логи)'}\n"
         "Формат: +79151234567 Текст"
     )
 
@@ -113,7 +120,7 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != OWNER_ID:
         return
     if not wa_ready:
-        await update.message.reply_text("⏳ WhatsApp не готов, QR-код в логах Railway")
+        await update.message.reply_text("⏳ WhatsApp не готов, скриншоты в логах Railway")
         return
     text = update.message.text.strip()
     match = re.match(r"^(\+\d{10,15})\s+(.+)$", text, re.S)
@@ -139,21 +146,22 @@ def main():
         return
 
     import requests
-    # Сброс вебхука с принудительным удалением ожидающих обновлений
-    requests.get(f"https://api.telegram.org/bot{TOKEN}/deleteWebhook?drop_pending_updates=True")
-    print("Вебхук сброшен")
+    try:
+        requests.get(f"https://api.telegram.org/bot{TOKEN}/deleteWebhook?drop_pending_updates=True")
+        print("Вебхук сброшен")
+    except Exception as e:
+        print(f"Ошибка сброса вебхука: {e}")
 
     app = Application.builder().token(TOKEN).build()
     app.add_handler(CommandHandler("start", start_cmd))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
 
-    # Запускаем поток для WhatsApp
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     loop.run_until_complete(on_startup(app))
 
     print("🚀 Бот запущен")
-    app.run_polling(drop_pending_updates=True)
+    app.run_polling(drop_pending_updates=True, allowed_updates=["message"])
 
 if __name__ == "__main__":
     main()
