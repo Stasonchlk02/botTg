@@ -1,155 +1,164 @@
-import asyncio
 import os
-import re
 import time
+import asyncio
+import logging
 import threading
-from urllib.parse import quote
-
+from queue import Queue
 from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
-
-from selenium import webdriver
-from selenium.webdriver.chrome.service import Service
-from selenium.webdriver.chrome.options import Options
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
+import undetected_chromedriver as uc  # вместо стандартного selenium webdriver
 
-TOKEN = os.getenv("TELEGRAM_TOKEN")
-OWNER_ID = int(os.getenv("OWNER_ID", "1636373767"))
-SESSION_DIR = os.path.join(os.getcwd(), "chrome_session")
-
+# --- Настройки ---
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+SESSION_DIR = "/app/chrome_session"  # папка для сохранения сессии WhatsApp
+WA_READY = False
 driver = None
-wa_ready = False
 bot_app = None
 main_loop = None
+update_queue = Queue()  # очередь для обработки сообщений между потоками
 
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# --- Функции WhatsApp ---
 def start_whatsapp():
-    global driver, wa_ready, bot_app, main_loop
+    """Запускает undetected Chrome и открывает WhatsApp Web"""
+    global driver, WA_READY
+    try:
+        logger.info("Запуск undetected Chrome...")
+        options = uc.ChromeOptions()
+        options.add_argument(f"--user-data-dir={SESSION_DIR}")
+        options.add_argument("--headless=new")       # headless режим
+        options.add_argument("--no-sandbox")
+        options.add_argument("--disable-dev-shm-usage")
+        options.add_argument("--disable-gpu")
+        options.add_argument("--remote-debugging-port=9222")
 
-    options = Options()
-    options.add_argument(f"--user-data-dir={SESSION_DIR}")
-    options.add_argument("--headless=new")
-    options.add_argument("--no-sandbox")
-    options.add_argument("--disable-dev-shm-usage")
-    options.binary_location = "/usr/bin/google-chrome"
-    service = Service("/usr/bin/chromedriver")
+        driver = uc.Chrome(options=options)
+        driver.get("https://web.whatsapp.com")
+        logger.info("WhatsApp Web загружается, ожидание авторизации...")
 
-    driver = webdriver.Chrome(service=service, options=options)
-    driver.get("https://web.whatsapp.com")
-    print("WhatsApp загружен")
-
-    def send_to_telegram(text, photo=None):
-        if not bot_app or not main_loop:
-            return
-        if photo:
-            coro = bot_app.bot.send_photo(OWNER_ID, photo, caption=text)
-        else:
-            coro = bot_app.bot.send_message(OWNER_ID, text)
-        asyncio.run_coroutine_threadsafe(coro, main_loop)
-
-    # Проверяем, возможно уже авторизованы (есть чат-лист)
-    for _ in range(10):
-        time.sleep(3)
-        if driver.find_elements(By.CSS_SELECTOR, "div[data-testid='chat-list']"):
-            wa_ready = True
-            print("✅ WhatsApp уже авторизован")
-            send_to_telegram("✅ WhatsApp готов!")
-            return
-
-    # Если нет — ищем QR
-    print("Поиск QR-кода...")
-    for _ in range(10):
-        qr = driver.find_elements(By.CSS_SELECTOR, "canvas[aria-label='QR code']")
-        if qr:
-            png = driver.get_screenshot_as_png()
-            send_to_telegram("🔐 Отсканируйте QR-код в WhatsApp Web", png)
-            print("QR отправлен в Telegram")
-            # Бесконечно ждём авторизации
-            while True:
-                time.sleep(5)
-                if driver.find_elements(By.CSS_SELECTOR, "div[data-testid='chat-list']"):
-                    wa_ready = True
-                    print("✅ WhatsApp авторизован после QR")
-                    send_to_telegram("✅ WhatsApp готов!")
-                    return
-        time.sleep(3)
-
-    # Если за 30 секунд QR не появился
-    png = driver.get_screenshot_as_png()
-    send_to_telegram("❌ Не удалось найти QR-код. Проверьте логи.", png)
-    wa_ready = False
-    print("❌ WhatsApp не авторизован")
+        # Ждём появления панели чатов (признак успешного входа)
+        WebDriverWait(driver, 120).until(
+            EC.presence_of_element_located((By.XPATH, "//div[@data-testid='chat-list']"))
+        )
+        WA_READY = True
+        logger.info("WhatsApp авторизован и готов к работе")
+    except Exception as e:
+        logger.error(f"Ошибка запуска WhatsApp: {e}")
+        WA_READY = False
 
 def send_whatsapp(phone: str, text: str):
-    phone = re.sub(r"\D", "", phone)
-    url = f"https://web.whatsapp.com/send?phone={phone}&text={quote(text)}"
-    driver.get(url)
-    input_box = WebDriverWait(driver, 30).until(
-        EC.presence_of_element_located((By.CSS_SELECTOR, "div[contenteditable='true']"))
-    )
-    time.sleep(2)
-    input_box.send_keys("\n")
-    time.sleep(2)
-    if input_box.text.strip() == "":
-        return
-    for sel in ["button[aria-label='Отправить']", "button[aria-label='Send']", "span[data-testid='send']"]:
-        try:
-            btn = WebDriverWait(driver, 3).until(EC.element_to_be_clickable((By.CSS_SELECTOR, sel)))
-            driver.execute_script("arguments[0].click();", btn)
-            return
-        except:
-            pass
-    raise Exception("Не удалось отправить")
+    """Отправляет сообщение через WhatsApp Web"""
+    global driver, WA_READY
+    if not WA_READY or driver is None:
+        logger.error("WhatsApp не готов")
+        return False
 
-async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != OWNER_ID:
-        return
+    try:
+        # Формируем ссылку для отправки сообщения конкретному номеру
+        url = f"https://web.whatsapp.com/send?phone={phone}&text={text}"
+        driver.get(url)
+        logger.info(f"Открыт чат с {phone}")
+
+        # Ожидаем поле ввода сообщения (более точный XPath)
+        input_box = WebDriverWait(driver, 60).until(
+            EC.element_to_be_clickable((By.XPATH, "//div[@contenteditable='true'][@data-tab='10']"))
+        )
+        # Альтернативный XPath, если первый не работает:
+        # input_box = WebDriverWait(driver, 60).until(
+        #     EC.element_to_be_clickable((By.XPATH, "//div[@contenteditable='true']"))
+        # )
+
+        # Вводим текст и отправляем
+        input_box.clear()
+        input_box.send_keys(text)
+        time.sleep(0.5)
+
+        # Нажимаем Enter
+        send_button = WebDriverWait(driver, 10).until(
+            EC.element_to_be_clickable((By.XPATH, "//button[@data-testid='compose-btn-send']"))
+        )
+        send_button.click()
+
+        logger.info(f"Сообщение отправлено {phone}")
+        return True
+    except Exception as e:
+        logger.error(f"Ошибка отправки: {e}")
+        return False
+
+# --- Telegram обработчики ---
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        f"Статус WhatsApp: {'✅ готов' if wa_ready else '⏳ ожидает авторизации'}\n"
-        "Формат сообщения: +79151234567 Текст"
+        "👋 Бот готов!\n"
+        "Используй команду /send <номер> <текст>\n"
+        "Пример: /send 79991234567 Привет!"
     )
+
+async def send_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args or len(context.args) < 2:
+        await update.message.reply_text("❌ Использование: /send <номер> <текст>")
+        return
+
+    phone = context.args[0]
+    # Убираем все нецифровые символы из номера
+    phone = ''.join(filter(str.isdigit, phone))
+    if len(phone) < 10:
+        await update.message.reply_text("❌ Некорректный номер телефона")
+        return
+
+    text = ' '.join(context.args[1:])
+    await update.message.reply_text(f"📤 Отправляю {phone}...")
+
+    # Запускаем отправку в отдельном потоке, чтобы не блокировать Telegram
+    def do_send():
+        result = send_whatsapp(phone, text)
+        asyncio.run_coroutine_threadsafe(
+            update.message.reply_text("✅ Отправлено!" if result else "❌ Ошибка отправки"),
+            main_loop
+        )
+
+    threading.Thread(target=do_send, daemon=True).start()
 
 async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != OWNER_ID:
-        return
-    if not wa_ready:
-        await update.message.reply_text("WhatsApp не готов. Дождитесь авторизации (QR придёт в Telegram).")
-        return
-    m = re.match(r"^(\+\d{10,15})\s+(.+)$", update.message.text.strip(), re.S)
-    if not m:
-        await update.message.reply_text("Формат: +79151234567 Текст")
-        return
-    phone, msg = m.groups()
-    await update.message.reply_text(f"📤 Отправляю на {phone}...")
-    loop = asyncio.get_running_loop()
-    await loop.run_in_executor(None, send_whatsapp, phone, msg)
-    await update.message.reply_text("✅ Отправлено")
+    """Обработка обычных текстовых сообщений (например, можно парсить номер и текст)"""
+    text = update.message.text
+    # Можно реализовать свой формат, например "номер текст"
+    parts = text.split(maxsplit=1)
+    if len(parts) == 2 and parts[0].isdigit():
+        phone = parts[0]
+        msg = parts[1]
+        await update.message.reply_text(f"📤 Отправляю {phone}...")
+        threading.Thread(target=lambda: send_whatsapp(phone, msg), daemon=True).start()
+    else:
+        await update.message.reply_text("Отправь номер и сообщение через пробел, например:\n79991234567 Привет!")
 
-def main():
-    global bot_app, main_loop
-    if not TOKEN:
-        print("❌ Нет TELEGRAM_TOKEN")
-        return
-    import requests
-    try:
-        requests.get(f"https://api.telegram.org/bot{TOKEN}/deleteWebhook?drop_pending_updates=True", timeout=5)
-        print("✅ Вебхук сброшен")
-    except Exception as e:
-        print(f"⚠️ Ошибка сброса вебхука: {e}")
-    time.sleep(2)
-
-    bot_app = Application.builder().token(TOKEN).build()
-    bot_app.add_handler(CommandHandler("start", start_cmd))
+# --- Запуск бота ---
+def run_telegram():
+    """Запускает Telegram бота (в основном потоке asyncio)"""
+    global bot_app
+    bot_app = Application.builder().token(TELEGRAM_TOKEN).build()
+    bot_app.add_handler(CommandHandler("start", start))
+    bot_app.add_handler(CommandHandler("send", send_command))
     bot_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
 
-    main_loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(main_loop)
+    bot_app.run_polling()
 
-    threading.Thread(target=start_whatsapp, daemon=True).start()
+def main():
+    global main_loop
+    # Запускаем WhatsApp в отдельном потоке
+    wa_thread = threading.Thread(target=start_whatsapp, daemon=True)
+    wa_thread.start()
 
-    print("🚀 Бот запущен")
-    bot_app.run_polling(drop_pending_updates=True, allowed_updates=["message"])
+    # Ждём инициализации WhatsApp
+    time.sleep(10)
+
+    # Запускаем Telegram бота
+    main_loop = asyncio.get_event_loop()
+    run_telegram()
 
 if __name__ == "__main__":
     main()
