@@ -40,7 +40,7 @@ def get_driver():
     options.add_argument("--remote-debugging-port=9222")
     options.add_argument("--disable-extensions")
     options.add_argument("--disable-setuid-sandbox")
-    options.add_argument("--lang=en-US")
+    options.add_argument("--lang=ru-RU")
     options.add_argument(
         "--user-agent=Mozilla/5.0 (X11; Linux x86_64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -72,6 +72,20 @@ def send_to_telegram(text, photo=None):
 
 
 # ==================== POPUP / DIALOG HELPERS ====================
+
+def get_element_text(el):
+    """Надёжно получает текст элемента через JS."""
+    try:
+        txt = driver.execute_script("""
+            return (arguments[0].innerText || arguments[0].textContent || '').trim();
+        """, el)
+        return txt or ""
+    except Exception:
+        try:
+            return el.text or ""
+        except Exception:
+            return ""
+
 
 def click_visible(el):
     """Надёжный клик по элементу."""
@@ -348,9 +362,14 @@ def wait_for_composer(timeout=20):
     return None
 
 
-def open_draft_chat(phone: str):
-    """Если WhatsApp создал черновик — кликаем по чату слева."""
-    phone_tail = re.sub(r"\D", "", phone)[-10:]
+def open_draft_chat(phone: str, text: str):
+    """Ищет нужный черновик слева и открывает его."""
+    phone_digits = re.sub(r"\D", "", phone)
+    phone_tail10 = phone_digits[-10:] if len(phone_digits) >= 10 else phone_digits
+    phone_tail7 = phone_digits[-7:] if len(phone_digits) >= 7 else phone_digits
+
+    msg_hint = (text or "").strip().lower()
+    msg_hint_short = msg_hint[:20] if msg_hint else ""
 
     try:
         rows = driver.find_elements(
@@ -363,44 +382,61 @@ def open_draft_chat(phone: str):
 
     print(f"[WA] Найдено строк чатов слева: {len(rows)}")
 
-    for row in rows:
+    visible_rows = []
+
+    for idx, row in enumerate(rows):
         try:
             if not row.is_displayed():
                 continue
 
-            txt = (row.text or "").strip().lower()
+            txt = get_element_text(row).strip().lower()
             digits = re.sub(r"\D", "", txt)
 
-            if phone_tail and phone_tail in digits:
-                print(f"[WA] Нашёл чат по номеру: {txt[:80]}")
-                click_visible(row)
-                time.sleep(2)
-                return True
+            if idx < 10:
+                print(f"[WA] row[{idx}] = {txt[:120]!r}")
 
-            if "черновик" in txt or "draft" in txt:
-                print(f"[WA] Нашёл чат с черновиком: {txt[:80]}")
-                click_visible(row)
-                time.sleep(2)
-                return True
+            visible_rows.append((row, txt, digits))
         except Exception:
             pass
 
-    # Fallback: кликнуть по первому чату в списке
-    try:
-        if rows:
-            first_visible = None
-            for r in rows:
-                if r.is_displayed():
-                    first_visible = r
-                    break
-            if first_visible:
-                print("[WA] Fallback: кликаю по первому видимому чату")
-                click_visible(first_visible)
+    # 1. Идеальный вариант: строка с черновиком и нашим текстом/номером
+    for row, txt, digits in visible_rows:
+        if "черновик" in txt or "draft" in txt:
+            if (msg_hint_short and msg_hint_short in txt) or \
+               (phone_tail10 and phone_tail10 in digits) or \
+               (phone_tail7 and phone_tail7 in digits):
+                print(f"[WA] ✅ Нашёл нужный черновик: {txt[:120]}")
+                click_visible(row)
                 time.sleep(2)
                 return True
-    except Exception:
-        pass
 
+    # 2. Поиск по номеру
+    for row, txt, digits in visible_rows:
+        if (phone_tail10 and phone_tail10 in digits) or \
+           (phone_tail7 and phone_tail7 in digits):
+            print(f"[WA] ✅ Нашёл чат по номеру: {txt[:120]}")
+            click_visible(row)
+            time.sleep(2)
+            return True
+
+    # 3. Поиск по фрагменту текста сообщения
+    if msg_hint_short:
+        for row, txt, digits in visible_rows:
+            if msg_hint_short in txt:
+                print(f"[WA] ✅ Нашёл чат по тексту: {txt[:120]}")
+                click_visible(row)
+                time.sleep(2)
+                return True
+
+    # 4. Просто любой черновик
+    for row, txt, digits in visible_rows:
+        if "черновик" in txt or "draft" in txt:
+            print(f"[WA] ✅ Нашёл хотя бы черновик: {txt[:120]}")
+            click_visible(row)
+            time.sleep(2)
+            return True
+
+    print("[WA] ❌ Не удалось найти нужный черновик/чат")
     return False
 
 
@@ -427,7 +463,6 @@ def click_send_button(timeout=15):
                 for el in elements:
                     if not el.is_displayed():
                         continue
-                    # Пробуем кликнуть по parent button
                     try:
                         parent_btn = el.find_element(
                             By.XPATH,
@@ -526,10 +561,10 @@ def click_send_button(timeout=15):
 
 def send_whatsapp(phone: str, text: str):
     """Отправка сообщения через WhatsApp Web."""
-    phone = re.sub(r"\D", "", phone)
+    phone_clean = re.sub(r"\D", "", phone)
     url = (
         f"https://web.whatsapp.com/send"
-        f"?phone={phone}"
+        f"?phone={phone_clean}"
         f"&text={quote(text)}"
         f"&type=phone_number"
         f"&app_absent=0"
@@ -547,7 +582,7 @@ def send_whatsapp(phone: str, text: str):
     # Проверка на ошибку номера
     page_source = driver.page_source.lower()
     if "phone number shared via url is invalid" in page_source:
-        raise Exception(f"Номер {phone} не найден в WhatsApp")
+        raise Exception(f"Номер {phone_clean} не найден в WhatsApp")
 
     # Скриншот для отладки
     png_step1 = driver.get_screenshot_as_png()
@@ -562,7 +597,7 @@ def send_whatsapp(phone: str, text: str):
         png_step2 = driver.get_screenshot_as_png()
         send_to_telegram("🔍 Шаг 2: чат не открылся, ищу черновик", png_step2)
 
-        opened = open_draft_chat(phone)
+        opened = open_draft_chat(phone_clean, text)
         if opened:
             time.sleep(2)
             close_blocking_popups()
