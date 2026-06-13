@@ -20,10 +20,10 @@ SESSION_DIR = os.path.join(os.getcwd(), "chrome_session")
 
 driver = None
 wa_ready = False
-bot_app = None
 
-async def init_whatsapp():
-    global driver, wa_ready, bot_app
+# Эта функция запускается один раз при старте бота (синхронно, в отдельном потоке)
+def start_whatsapp():
+    global driver, wa_ready
 
     options = Options()
     options.add_argument(f"--user-data-dir={SESSION_DIR}")
@@ -36,42 +36,20 @@ async def init_whatsapp():
     options.binary_location = "/usr/bin/google-chrome"
 
     service = Service("/usr/bin/chromedriver")
-
-    try:
-        driver = webdriver.Chrome(service=service, options=options)
-    except Exception as e:
-        print(f"Ошибка Chrome: {e}")
-        await bot_app.bot.send_message(OWNER_ID, f"❌ Ошибка браузера: {e}")
-        return
-
+    driver = webdriver.Chrome(service=service, options=options)
     driver.get("https://web.whatsapp.com")
-    print("WhatsApp Web загружен")
-    await asyncio.sleep(5)
+    print("WhatsApp Web загружен, ожидание авторизации...")
 
-    if driver.find_elements(By.CSS_SELECTOR, "div[data-testid='chat-list']"):
-        wa_ready = True
-        print("✅ Уже авторизован")
-        await bot_app.bot.send_message(OWNER_ID, "✅ WhatsApp готов!")
-        return
-
-    for attempt in range(15):
-        qr = driver.find_elements(By.CSS_SELECTOR, "canvas[aria-label='QR code']")
-        if qr:
-            png = driver.get_screenshot_as_png()
-            await bot_app.bot.send_photo(OWNER_ID, photo=png, caption="🔐 Отсканируйте QR")
-            print("QR отправлен")
-            for _ in range(40):
-                await asyncio.sleep(3)
-                if driver.find_elements(By.CSS_SELECTOR, "div[data-testid='chat-list']"):
-                    wa_ready = True
-                    await bot_app.bot.send_message(OWNER_ID, "✅ WhatsApp готов!")
-                    return
-            await bot_app.bot.send_message(OWNER_ID, "⚠️ Время истекло")
+    # Ждём появления чат-листа (уже авторизован)
+    for _ in range(30):  # 90 секунд
+        time.sleep(3)
+        if driver.find_elements(By.CSS_SELECTOR, "div[data-testid='chat-list']"):
+            wa_ready = True
+            print("✅ WhatsApp готов!")
             return
-        await asyncio.sleep(3)
-
-    png = driver.get_screenshot_as_png()
-    await bot_app.bot.send_photo(OWNER_ID, photo=png, caption="❌ QR не найден")
+    # Если не дождались – возможно, нужен QR. Но ты уже подключился, так что должно быть ок.
+    wa_ready = False
+    print("❌ WhatsApp не авторизован")
 
 def send_whatsapp(phone: str, text: str):
     phone = re.sub(r"\D", "", phone)
@@ -108,7 +86,7 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Нет доступа")
         return
     await update.message.reply_text(
-        f"Статус WhatsApp: {'✅ готов' if wa_ready else '⏳ ожидает QR'}\n"
+        f"Статус WhatsApp: {'✅ готов' if wa_ready else '⏳ не готов'}\n"
         "Формат: +79151234567 Текст"
     )
 
@@ -116,7 +94,7 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != OWNER_ID:
         return
     if not wa_ready:
-        await update.message.reply_text("WhatsApp не готов, ждите QR")
+        await update.message.reply_text("WhatsApp не готов, попробуйте позже")
         return
     text = update.message.text.strip()
     match = re.match(r"^(\+\d{10,15})\s+(.+)$", text, re.S)
@@ -124,7 +102,7 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Формат: +79151234567 Текст")
         return
     phone, message = match.groups()
-    await update.message.reply_text(f"📤 Отправляю {phone}...")
+    await update.message.reply_text(f"📤 Отправляю на {phone}...")
     try:
         loop = asyncio.get_running_loop()
         await loop.run_in_executor(None, send_whatsapp, phone, message)
@@ -132,22 +110,27 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         await update.message.reply_text(f"❌ {e}")
 
-async def post_init(app: Application):
-    global bot_app
-    bot_app = app
-    await asyncio.sleep(2)
-    asyncio.create_task(init_whatsapp())
-
 def main():
     if not TOKEN:
-        print("Нет токена")
+        print("❌ Нет TELEGRAM_TOKEN")
         return
+
+    # Сбрасываем вебхук, чтобы избежать конфликта
     import requests
-    requests.get(f"https://api.telegram.org/bot{TOKEN}/deleteWebhook?drop_pending_updates=True")
+    try:
+        requests.get(f"https://api.telegram.org/bot{TOKEN}/deleteWebhook?drop_pending_updates=True", timeout=5)
+        print("✅ Вебхук сброшен")
+    except Exception as e:
+        print(f"⚠️ Ошибка сброса вебхука: {e}")
+
+    # Запускаем WhatsApp в отдельном потоке, чтобы не блокировать бота
+    import threading
+    threading.Thread(target=start_whatsapp, daemon=True).start()
+
     app = Application.builder().token(TOKEN).build()
     app.add_handler(CommandHandler("start", start_cmd))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
-    app.post_init = post_init
+
     print("🚀 Бот запущен")
     app.run_polling(drop_pending_updates=True)
 
