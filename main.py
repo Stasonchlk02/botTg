@@ -280,69 +280,89 @@ def send_whatsapp(phone: str, text: str):
     close_blocking_popups()
     time.sleep(2)
 
-    # Проверяем — нет ли ошибки "номер не найден"
+    # Проверяем ошибку номера
     page_source = driver.page_source
     if "phone number shared via url is invalid" in page_source.lower():
         raise Exception(f"Номер {phone} не найден в WhatsApp")
 
-    input_selectors = [
-        "div[contenteditable='true'][data-tab='10']",
-        "div[contenteditable='true'][data-tab='1']",
-        "footer div[contenteditable='true']",
-        "div[role='textbox']",
-        "div[contenteditable='true']",
-    ]
-
-    input_box = None
-    for sel in input_selectors:
-        try:
-            input_box = WebDriverWait(driver, 15).until(
-                EC.element_to_be_clickable((By.CSS_SELECTOR, sel))
-            )
-            print(f"[WA] Поле ввода найдено: {sel}")
-            break
-        except Exception:
-            print(f"[WA] Селектор не сработал: {sel}")
-            continue
-
-    if not input_box:
-        png = driver.get_screenshot_as_png()
-        send_to_telegram("❌ Поле ввода не найдено. Скриншот:", png)
-        raise Exception("Поле ввода не найдено ни по одному селектору")
-
-    # Отправляем
-    try:
-        input_box.click()
-        time.sleep(1)
-        input_box.send_keys(Keys.ENTER)
-        time.sleep(2)
-        print("[WA] Сообщение отправлено через Enter")
-        return
-    except Exception as e:
-        print(f"[WA] Ошибка Enter: {e}")
-
-    # Fallback: кнопка отправки
+    # Ждём появления кнопки "Отправить" — она появляется когда текст вставлен
     send_selectors = [
         "button[data-testid='compose-btn-send']",
+        "span[data-testid='send']",
         "button[aria-label='Send']",
         "button[aria-label='Отправить']",
-        "span[data-testid='send']",
         "button[data-tab='11']",
     ]
 
+    # Сначала ждём пока текст подгрузится в поле ввода (URL уже содержит text=)
+    time.sleep(3)
+
+    # Пробуем найти и нажать кнопку отправки
     for sel in send_selectors:
         try:
-            btn = WebDriverWait(driver, 5).until(
+            btn = WebDriverWait(driver, 10).until(
                 EC.element_to_be_clickable((By.CSS_SELECTOR, sel))
             )
             driver.execute_script("arguments[0].click();", btn)
-            print(f"[WA] Отправлено кнопкой: {sel}")
+            print(f"[WA] ✅ Отправлено кнопкой: {sel}")
             time.sleep(2)
             return
         except Exception:
+            print(f"[WA] Кнопка не найдена: {sel}")
             continue
 
-    raise Exception("Не удалось отправить: ни Enter, ни кнопка не сработали")
+    # Fallback: ищем кнопку через XPATH
+    xpath_selectors = [
+        "//button[@data-testid='compose-btn-send']",
+        "//span[@data-testid='send']/ancestor::button",
+        "//button[.//span[@data-icon='send']]",
+    ]
+
+    for sel in xpath_selectors:
+        try:
+            btn = WebDriverWait(driver, 5).until(
+                EC.element_to_be_clickable((By.XPATH, sel))
+            )
+            driver.execute_script("arguments[0].click();", btn)
+            print(f"[WA] ✅ Отправлено XPATH: {sel}")
+            time.sleep(2)
+            return
+        except Exception:
+            print(f"[WA] XPATH не сработал: {sel}")
+            continue
+
+    # Fallback 2: кликаем по span[data-icon='send'] напрямую
+    try:
+        send_icon = driver.find_element(By.CSS_SELECTOR, "span[data-icon='send']")
+        parent = send_icon.find_element(By.XPATH, "./..")
+        driver.execute_script("arguments[0].click();", parent)
+        print("[WA] ✅ Отправлено через data-icon='send'")
+        time.sleep(2)
+        return
+    except Exception:
+        print("[WA] data-icon='send' не найден")
+
+    # Последний fallback: ищем поле ввода и жмём Enter
+    try:
+        input_box = driver.find_element(By.CSS_SELECTOR, "div[contenteditable='true']")
+        input_box.click()
+        time.sleep(0.5)
+
+        # Используем ActionChains для правильного Enter
+        from selenium.webdriver.common.action_chains import ActionChains
+        actions = ActionChains(driver)
+        actions.send_keys(Keys.ENTER)
+        actions.perform()
+        print("[WA] ✅ Отправлено через ActionChains Enter")
+        time.sleep(2)
+        return
+    except Exception as e:
+        print(f"[WA] ActionChains тоже не сработал: {e}")
+
+    # Если ничего не помогло — скриншот
+    png = driver.get_screenshot_as_png()
+    send_to_telegram("❌ Не удалось нажать кнопку отправки. Скриншот:", png)
+    raise Exception("Не удалось отправить: ни одна кнопка/метод не сработали")
 
 
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
