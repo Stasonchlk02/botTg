@@ -33,7 +33,7 @@ def start_whatsapp():
     options.add_argument("--disable-dev-shm-usage")
     options.add_argument("--disable-gpu")
     options.add_argument("--window-size=1920,1080")
-    options.binary_location = "/usr/bin/chromium"
+    options.binary_location = "/usr/bin/google-chrome"
 
     service = Service("/usr/bin/chromedriver")
     driver = webdriver.Chrome(service=service, options=options)
