@@ -1,0 +1,1 @@
+{"cookies": [{"name": "wa_ul", "value": "3931ac5a-229c-403e-8d3e-447487bbab7a", "domain": ".web.whatsapp.com", "path": "/", "expires": 1789133859.081596, "httpOnly": true, "secure": true, "sameSite": "Lax"}], "origins": [{"origin": "https://web.whatsapp.com", "localStorage": [{"name": "Session", "value": "pf1q9b:1781357893676"}]}]}
