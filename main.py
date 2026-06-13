@@ -23,10 +23,11 @@ SESSION_DIR = os.path.join(os.getcwd(), "chrome_session")
 driver = None
 wa_ready = False
 application = None
+main_loop = None  # сохраняем event loop основного потока
 
 # ========== ИНИЦИАЛИЗАЦИЯ WHATSAPP С ОТЛАДКОЙ ==========
 def start_whatsapp():
-    global driver, wa_ready, application
+    global driver, wa_ready, application, main_loop
 
     print("🟡 Настройка Chrome options...")
     options = Options()
@@ -46,14 +47,20 @@ def start_whatsapp():
     driver.get("https://web.whatsapp.com")
     print("🟡 Страница WhatsApp Web загружена")
 
+    # Функция для отправки фото/сообщения в Telegram из потока
+    def send_to_owner(text, photo_path=None):
+        if not application or not main_loop:
+            return
+        if photo_path:
+            with open(photo_path, "rb") as f:
+                coro = application.bot.send_photo(OWNER_ID, f, caption=text)
+        else:
+            coro = application.bot.send_message(OWNER_ID, text)
+        asyncio.run_coroutine_threadsafe(coro, main_loop)
+
     # Отправляем первый скриншот для диагностики
     driver.save_screenshot("/tmp/after_load.png")
-    if application:
-        with open("/tmp/after_load.png", "rb") as f:
-            asyncio.run_coroutine_threadsafe(
-                application.bot.send_photo(OWNER_ID, f, caption="📸 Скриншот после загрузки страницы"),
-                asyncio.get_event_loop()
-            )
+    send_to_owner("📸 Скриншот после загрузки страницы", "/tmp/after_load.png")
 
     # Ждём до 60 секунд появления либо чатов, либо QR-кода
     for attempt in range(20):  # 20 * 3 = 60 секунд
@@ -66,11 +73,7 @@ def start_whatsapp():
             )
             wa_ready = True
             print("✅ WhatsApp готов!")
-            if application:
-                asyncio.run_coroutine_threadsafe(
-                    application.bot.send_message(OWNER_ID, "✅ WhatsApp Web авторизован!"),
-                    asyncio.get_event_loop()
-                )
+            send_to_owner("✅ WhatsApp Web авторизован!")
             return
         except:
             pass
@@ -81,36 +84,21 @@ def start_whatsapp():
             if qr:
                 print("📱 Обнаружен QR-код, сохраняем скриншот...")
                 driver.save_screenshot("/tmp/qr.png")
-                if application:
-                    with open("/tmp/qr.png", "rb") as f:
-                        asyncio.run_coroutine_threadsafe(
-                            application.bot.send_photo(OWNER_ID, f, caption="🔐 Отсканируйте QR-код в WhatsApp Web"),
-                            asyncio.get_event_loop()
-                        )
-                # Даём время на сканирование
-                time.sleep(20)
+                send_to_owner("🔐 Отсканируйте QR-код в WhatsApp Web", "/tmp/qr.png")
+                time.sleep(20)  # даём время на сканирование
                 continue
         except:
             pass
 
         # Если ничего не нашли — делаем скриншот и отправляем раз в 30 секунд
-        if attempt % 10 == 0:  # раз в ~30 секунд
+        if attempt % 10 == 0:
             driver.save_screenshot("/tmp/debug.png")
-            if application:
-                with open("/tmp/debug.png", "rb") as f:
-                    asyncio.run_coroutine_threadsafe(
-                        application.bot.send_photo(OWNER_ID, f, caption=f"⚠️ Не могу войти (попытка {attempt+1})"),
-                        asyncio.get_event_loop()
-                    )
+            send_to_owner(f"⚠️ Не могу войти (попытка {attempt+1})", "/tmp/debug.png")
 
     # Если вышли из цикла — что-то пошло не так
     wa_ready = False
     print("❌ WhatsApp не готов после 60 секунд!")
-    if application:
-        asyncio.run_coroutine_threadsafe(
-            application.bot.send_message(OWNER_ID, "❌ Не удалось авторизовать WhatsApp. Проверь логи."),
-            asyncio.get_event_loop()
-        )
+    send_to_owner("❌ Не удалось авторизовать WhatsApp. Проверь логи.")
 
 # ========== ОТПРАВКА СООБЩЕНИЯ ==========
 def send_whatsapp(phone: str, text: str):
@@ -196,8 +184,9 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ========== ЗАПУСК ==========
 async def on_startup(app: Application):
-    global application
+    global application, main_loop
     application = app
+    main_loop = asyncio.get_running_loop()  # сохраняем event loop основного потока
     print("🚀 Запуск WhatsApp в отдельном потоке...")
     threading.Thread(target=start_whatsapp, daemon=True).start()
 
