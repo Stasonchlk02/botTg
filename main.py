@@ -369,6 +369,7 @@ def main():
     bot_app.add_handler(CommandHandler("start", start_cmd))
     bot_app.add_handler(CommandHandler("restart", restart_wa_cmd))
     bot_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
+    bot_app.add_handler(CommandHandler("debug", debug_cmd))
 
     # Получаем event loop ДО запуска polling
     main_loop = asyncio.new_event_loop()
