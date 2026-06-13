@@ -562,19 +562,39 @@ def click_send_button(timeout=15):
 def send_whatsapp(phone: str, text: str):
     """Отправка сообщения через WhatsApp Web."""
     phone_clean = re.sub(r"\D", "", phone)
-    url = (
-        f"https://web.whatsapp.com/send"
-        f"?phone={phone_clean}"
-        f"&text={quote(text)}"
-        f"&type=phone_number"
-        f"&app_absent=0"
-    )
-
+    # Убраны &type=phone_number&app_absent=0 – иногда они ломают поведение
+    url = f"https://web.whatsapp.com/send?phone={phone_clean}&text={quote(text)}"
     print(f"[WA] Открываю URL: {url}")
     driver.get(url)
 
-    # Даём странице загрузиться
-    time.sleep(8)
+    # Даём странице начальную загрузку
+    time.sleep(10)  # увеличено для стабильности на Railway
+
+    # ---------- ПРОСТОЙ МЕТОД (как в локальной версии) ----------
+    # Если чат открылся нормально, просто ждём кнопку "Отправить" и кликаем
+    selectors = [
+        "button[aria-label='Отправить']",
+        "button[aria-label='Send']",
+        "span[data-testid='send']",
+        "span[data-icon='send']",
+    ]
+    for sel in selectors:
+        try:
+            btn = WebDriverWait(driver, 15).until(
+                EC.element_to_be_clickable((By.CSS_SELECTOR, sel))
+            )
+            # Используем JS-клик для надёжности
+            driver.execute_script("arguments[0].click();", btn)
+            print("[WA] ✅ Отправлено простым методом")
+            return  # Успех, выходим
+        except TimeoutException:
+            continue
+
+    print("[WA] Простой метод не сработал, перехожу к расширенному алгоритму...")
+    # -----------------------------------------------------------
+
+    # Если простой метод не сработал, выполняем всю остальную логику,
+    # которая была в вашем Railway-коде (закрытие попапов, черновики и т.д.)
     close_blocking_popups()
     click_continue_screens()
     time.sleep(2)
@@ -586,7 +606,7 @@ def send_whatsapp(phone: str, text: str):
 
     # Скриншот для отладки
     png_step1 = driver.get_screenshot_as_png()
-    send_to_telegram("🔍 Шаг 1: после загрузки URL", png_step1)
+    send_to_telegram("Шаг 1: после загрузки URL", png_step1)
 
     # Ждём открытия чата (поле ввода справа)
     composer = wait_for_composer(timeout=10)
@@ -595,8 +615,7 @@ def send_whatsapp(phone: str, text: str):
     if not composer:
         print("[WA] Чат справа не открылся, ищу черновик слева...")
         png_step2 = driver.get_screenshot_as_png()
-        send_to_telegram("🔍 Шаг 2: чат не открылся, ищу черновик", png_step2)
-
+        send_to_telegram("Шаг 2: чат не открылся, ищу черновик", png_step2)
         opened = open_draft_chat(phone_clean, text)
         if opened:
             time.sleep(2)
@@ -611,7 +630,7 @@ def send_whatsapp(phone: str, text: str):
 
     print("[WA] ✅ Поле ввода найдено")
     png_step3 = driver.get_screenshot_as_png()
-    send_to_telegram("🔍 Шаг 3: поле ввода найдено", png_step3)
+    send_to_telegram("Шаг 3: поле ввода найдено", png_step3)
 
     # Нажимаем кнопку отправки
     sent = click_send_button(timeout=15)
@@ -627,16 +646,14 @@ def send_whatsapp(phone: str, text: str):
         composer.send_keys(Keys.ENTER)
         print("[WA] ⚠️ Fallback: Enter в composer")
         time.sleep(2)
-
         png_step4 = driver.get_screenshot_as_png()
-        send_to_telegram("🔍 Шаг 4: после Enter", png_step4)
+        send_to_telegram("Шаг 4: после Enter", png_step4)
         return
     except Exception as e:
         print(f"[WA] Enter тоже не сработал: {e}")
-
-    png_final = driver.get_screenshot_as_png()
-    send_to_telegram("❌ Не удалось отправить. Скриншот:", png_final)
-    raise Exception("Не удалось отправить сообщение")
+        png_final = driver.get_screenshot_as_png()
+        send_to_telegram("❌ Не удалось отправить. Скриншот:", png_final)
+        raise Exception("Не удалось отправить сообщение")
 
 
 # ==================== TELEGRAM HANDLERS ====================
