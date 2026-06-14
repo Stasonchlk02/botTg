@@ -3,13 +3,10 @@ import os
 import re
 import time
 import threading
-import io
-import sqlite3
 from urllib.parse import quote
 
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
-
 from selenium import webdriver
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.chrome.options import Options
@@ -20,114 +17,18 @@ from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.common.action_chains import ActionChains
 from selenium.common.exceptions import TimeoutException
 
-from PyPDF2 import PdfReader
-
-# ==================== CONFIG ====================
 TOKEN = os.getenv("TELEGRAM_TOKEN")
 OWNER_ID = int(os.getenv("OWNER_ID", "1636373767"))
 SESSION_DIR = "/app/chrome_session"
-DB_PATH = "numbers.db"
 
 driver = None
 wa_ready = False
 bot_app = None
 main_loop = None
-db_lock = threading.Lock()
 
-# ==================== DATABASE ====================
-def init_db():
-    with db_lock:
-        conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS numbers (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                phone TEXT UNIQUE NOT NULL,
-                added_by INTEGER NOT NULL,
-                added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                sent INTEGER DEFAULT 0
-            )
-        """)
-        conn.commit()
-        conn.close()
-
-def add_number(phone: str, user_id: int) -> bool:
-    """Добавляет номер, если его ещё нет. Возвращает True, если добавлен."""
-    with db_lock:
-        conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-        try:
-            conn.execute("INSERT INTO numbers (phone, added_by) VALUES (?, ?)", (phone, user_id))
-            conn.commit()
-            return True
-        except sqlite3.IntegrityError:
-            return False
-        finally:
-            conn.close()
-
-def get_unsent_numbers():
-    """Возвращает список номеров, где sent=0."""
-    with db_lock:
-        conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-        cur = conn.execute("SELECT phone FROM numbers WHERE sent = 0")
-        numbers = [row[0] for row in cur.fetchall()]
-        conn.close()
-        return numbers
-
-def mark_sent(phone: str):
-    with db_lock:
-        conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-        conn.execute("UPDATE numbers SET sent = 1 WHERE phone = ?", (phone,))
-        conn.commit()
-        conn.close()
-
-def reset_all_sent():
-    with db_lock:
-        conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-        conn.execute("UPDATE numbers SET sent = 0")
-        conn.commit()
-        conn.close()
-
-def get_stats():
-    with db_lock:
-        conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-        total = conn.execute("SELECT COUNT(*) FROM numbers").fetchone()[0]
-        unsent = conn.execute("SELECT COUNT(*) FROM numbers WHERE sent = 0").fetchone()[0]
-        conn.close()
-        return total, unsent
-
-def get_all_numbers():
-    with db_lock:
-        conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-        cur = conn.execute("SELECT phone, sent FROM numbers ORDER BY id")
-        rows = cur.fetchall()
-        conn.close()
-        return rows
-
-# ==================== PHONE VALIDATION ====================
-def clean_russian_phone(raw: str) -> str | None:
-    """
-    Приводит российский номер к виду +7XXXXXXXXXX.
-    Возвращает None, если номер невалидный.
-    """
-    digits = re.sub(r'\D', '', raw)
-    if len(digits) == 11 and digits[0] in ('7', '8'):
-        return '+7' + digits[1:]
-    elif len(digits) == 10 and digits[0] == '9':
-        return '+7' + digits
-    return None
-
-def extract_russian_phones(text: str) -> list[str]:
-    """Извлекает все уникальные валидные российские номера из текста."""
-    # Ищем потенциальные номера: +7/8 с кодом и номером, допуская разделители
-    pattern = r'(\+?[78][\s\-]?\(?\d{3}\)?[\s\-]?\d{3}[\s\-]?\d{2}[\s\-]?\d{2})'
-    candidates = re.findall(pattern, text)
-    cleaned = set()
-    for c in candidates:
-        phone = clean_russian_phone(c)
-        if phone:
-            cleaned.add(phone)
-    return list(cleaned)
 
 # ==================== BROWSER ====================
+
 def get_driver():
     options = Options()
     options.add_argument(f"--user-data-dir={SESSION_DIR}")
@@ -146,14 +47,15 @@ def get_driver():
         "Chrome/120.0.0.0 Safari/537.36"
     )
     options.binary_location = "/usr/bin/google-chrome"
-
     service = Service(
         "/usr/bin/chromedriver",
         service_args=["--log-level=WARNING"]
     )
     return webdriver.Chrome(service=service, options=options)
 
+
 # ==================== TELEGRAM HELPER ====================
+
 def send_to_telegram(text, photo=None):
     if not bot_app or not main_loop:
         print(f"[WA→TG] bot_app или main_loop не готов: {text}")
@@ -168,8 +70,11 @@ def send_to_telegram(text, photo=None):
     except Exception as e:
         print(f"[send_to_telegram] Ошибка: {e}")
 
+
 # ==================== POPUP / DIALOG HELPERS ====================
+
 def get_element_text(el):
+    """Надёжно получает текст элемента через JS."""
     try:
         txt = driver.execute_script("""
             return (arguments[0].innerText || arguments[0].textContent || '').trim();
@@ -181,9 +86,13 @@ def get_element_text(el):
         except Exception:
             return ""
 
+
 def click_visible(el):
+    """Надёжный клик по элементу."""
     try:
-        driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", el)
+        driver.execute_script(
+            "arguments[0].scrollIntoView({block: 'center'});", el
+        )
         time.sleep(0.3)
     except Exception:
         pass
@@ -192,7 +101,9 @@ def click_visible(el):
     except Exception:
         driver.execute_script("arguments[0].click();", el)
 
+
 def close_dialog_if_exists():
+    """Закрывает div[role='dialog'] если он есть."""
     try:
         dialogs = driver.find_elements(By.CSS_SELECTOR, "div[role='dialog']")
         for dialog in dialogs:
@@ -200,375 +111,676 @@ def close_dialog_if_exists():
                 continue
             print("⚠️ Найден dialog, пробую закрыть")
             buttons = dialog.find_elements(
-                By.XPATH,
-                ".//button | .//div[@role='button']"
+                By.XPATH, ".//button | .//div[@role='button']"
             )
             for btn in buttons:
-                text = (btn.text or "").lower()
-                if "close" in text or "cancel" in text or "not now" in text:
-                    click_visible(btn)
-                    time.sleep(0.5)
-                    break
+                text = (btn.text or "").strip().lower()
+                aria = (btn.get_attribute("aria-label") or "").strip().lower()
+                keywords = [
+                    "continue", "продолжить", "ok", "ок",
+                    "понятно", "close", "закрыть", "not now",
+                    "сейчас не надо", "got it"
+                ]
+                if any(w in text for w in keywords) or any(w in aria for w in keywords):
+                    driver.execute_script("arguments[0].click();", btn)
+                    print(f"✅ Dialog закрыт: text='{btn.text}' aria='{aria}'")
+                    time.sleep(1)
+                    return
     except Exception as e:
-        print(f"close_dialog_if_exists: {e}")
+        print(f"[close_dialog] Ошибка: {e}")
 
-def is_modal_present():
+
+def close_blocking_popups():
+    """Закрывает мешающие окна WhatsApp Web."""
+    if not driver:
+        return
+
+    popup_selectors = [
+        (By.CSS_SELECTOR, "button[aria-label='Close']"),
+        (By.CSS_SELECTOR, "button[aria-label='Закрыть']"),
+        (By.CSS_SELECTOR, "div[aria-label='Close']"),
+        (By.CSS_SELECTOR, "div[aria-label='Закрыть']"),
+        (By.CSS_SELECTOR, "span[data-testid='x']"),
+        (By.CSS_SELECTOR, "span[data-testid='x-alt']"),
+        (By.XPATH, "//button[contains(., 'Continue')]"),
+        (By.XPATH, "//button[contains(., 'Продолжить')]"),
+        (By.XPATH, "//button[contains(., 'OK')]"),
+        (By.XPATH, "//button[contains(., 'ОК')]"),
+        (By.XPATH, "//button[contains(., 'Понятно')]"),
+        (By.XPATH, "//button[contains(., 'Got it')]"),
+        (By.XPATH, "//button[contains(., 'Not now')]"),
+        (By.XPATH, "//button[contains(., 'Сейчас не надо')]"),
+        (By.XPATH, "//div[@role='button'][contains(., 'Continue')]"),
+        (By.XPATH, "//div[@role='button'][contains(., 'Продолжить')]"),
+        (By.XPATH, "//div[@role='button'][contains(., 'OK')]"),
+        (By.XPATH, "//div[@role='button'][contains(., 'ОК')]"),
+        (By.XPATH, "//div[@role='button'][contains(., 'Понятно')]"),
+        (By.XPATH, "//div[@role='button'][contains(., 'Got it')]"),
+        (By.XPATH, "//div[@role='button'][contains(., 'Not now')]"),
+        (By.XPATH, "//div[@role='button'][contains(., 'Сейчас не надо')]"),
+    ]
+
+    for attempt in range(5):
+        closed_any = False
+        close_dialog_if_exists()
+
+        for by, selector in popup_selectors:
+            try:
+                elements = driver.find_elements(by, selector)
+                for el in elements:
+                    if el.is_displayed():
+                        try:
+                            driver.execute_script("arguments[0].click();", el)
+                            print(f"✅ Закрыта всплывашка [{attempt+1}]: {selector}")
+                            time.sleep(1)
+                            closed_any = True
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+
+        try:
+            body = driver.find_element(By.TAG_NAME, "body")
+            body.send_keys(Keys.ESCAPE)
+            time.sleep(0.5)
+        except Exception:
+            pass
+
+        if not closed_any:
+            break
+
+
+def click_continue_screens():
+    """Закрывает промежуточные экраны типа Continue to chat."""
+    texts = [
+        "Continue to chat",
+        "Продолжить чат",
+        "Use WhatsApp Web",
+        "Использовать WhatsApp Web",
+        "Continue",
+        "Продолжить",
+        "OK",
+        "ОК",
+        "Open",
+        "Открыть",
+    ]
+
+    clicked = False
+    for txt in texts:
+        xpath = (
+            f"//button[contains(., '{txt}')] | "
+            f"//div[@role='button'][contains(., '{txt}')] | "
+            f"//a[contains(., '{txt}')]"
+        )
+        try:
+            elements = driver.find_elements(By.XPATH, xpath)
+            for el in elements:
+                if el.is_displayed():
+                    click_visible(el)
+                    print(f"✅ Нажата промежуточная кнопка: {txt}")
+                    time.sleep(2)
+                    clicked = True
+        except Exception:
+            pass
+
+    return clicked
+
+
+# ==================== WHATSAPP AUTH ====================
+
+def is_authorized():
     try:
-        modals = driver.find_elements(By.CSS_SELECTOR, "[role='dialog'], .modal, .popup")
-        for modal in modals:
-            if modal.is_displayed():
+        close_blocking_popups()
+        selectors = [
+            "div[data-testid='chat-list']",
+            "div[aria-label='Список чатов']",
+            "div[aria-label='Chat list']",
+            "#pane-side",
+        ]
+        for sel in selectors:
+            if driver.find_elements(By.CSS_SELECTOR, sel):
                 return True
+        return False
     except Exception:
-        pass
-    return False
-
-def ensure_wa_ready():
-    global wa_ready
-    if wa_ready:
-        return True
-
-    print("🔄 Ожидание полной загрузки WhatsApp Web...")
-    try:
-        wait = WebDriverWait(driver, 120)
-        wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "div[data-testid='chat-list'], div[data-testid='list']")))
-        time.sleep(3)
-        close_dialog_if_exists()
-        time.sleep(1)
-
-        if is_modal_present():
-            print("⚠️ Обнаружен popup после закрытия диалогов, нажимаем ESC")
-            ActionChains(driver).send_keys(Keys.ESCAPE).perform()
-            time.sleep(1)
-
-        wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "div[data-testid='chat-list-search'], div[role='textbox']")))
-        close_dialog_if_exists()
-
-        print("✅ WhatsApp Web полностью загружен")
-        wa_ready = True
-        return True
-
-    except Exception as e:
-        print(f"❌ Ошибка загрузки WhatsApp Web: {e}")
-        send_to_telegram(f"❌ Ошибка загрузки WhatsApp Web: {e}")
         return False
 
-# ==================== WHATSAPP SENDER ====================
-def send_whatsapp(phone, message):
-    if not driver or not wa_ready:
-        if not ensure_wa_ready():
-            return False, "WhatsApp Web не готов"
+
+def wait_for_qr():
+    qr_selectors = [
+        "canvas[aria-label='QR code']",
+        "div[data-testid='qrcode']",
+        "div[aria-label='QR code']",
+        "canvas",
+    ]
+
+    for attempt in range(20):
+        time.sleep(3)
+        close_blocking_popups()
+
+        if is_authorized():
+            return "authorized"
+
+        for sel in qr_selectors:
+            elements = driver.find_elements(By.CSS_SELECTOR, sel)
+            if elements:
+                print(f"✅ QR найден по селектору: {sel}")
+                return "qr_found"
+
+        print(f"[{attempt+1}/20] Ожидание QR или авторизации...")
+
+    return "timeout"
+
+
+def start_whatsapp():
+    global driver, wa_ready
+
+    for _ in range(30):
+        if main_loop and main_loop.is_running():
+            break
+        time.sleep(1)
+
+    print(f"📁 SESSION_DIR: {SESSION_DIR}")
+    os.makedirs(SESSION_DIR, exist_ok=True)
 
     try:
-        phone = re.sub(r'[^\d+]', '', phone.strip())
-        if not phone.startswith('+'):
-            phone = '+' + phone
+        driver = get_driver()
+        driver.get("https://web.whatsapp.com")
+        print("🌐 WhatsApp Web загружен")
 
-        encoded_phone = quote(phone)
-        url = f"https://web.whatsapp.com/send?phone={encoded_phone}"
-        driver.get(url)
         time.sleep(5)
-        close_dialog_if_exists()
+        close_blocking_popups()
 
-        wait = WebDriverWait(driver, 60)
-        msg_box = wait.until(
-            EC.presence_of_element_located((By.CSS_SELECTOR, "div[contenteditable='true'][data-testid='conversation-compose-box-input'], div[contenteditable='true'][data-testid='conversation-compose-box-input'] p"))
-        )
+        result = wait_for_qr()
 
-        click_visible(msg_box)
-        time.sleep(0.5)
-        msg_box.send_keys(message)
-        time.sleep(0.5)
+        if result == "authorized":
+            wa_ready = True
+            print("✅ WhatsApp авторизован (сессия восстановлена)")
+            send_to_telegram("✅ WhatsApp готов! Сессия восстановлена.")
+            return
 
-        try:
-            send_btn = driver.find_element(By.CSS_SELECTOR, "button[data-testid='send-button']")
-            if send_btn.is_enabled():
-                click_visible(send_btn)
-            else:
-                raise Exception("Кнопка неактивна")
-        except Exception:
-            msg_box.send_keys(Keys.RETURN)
+        elif result == "qr_found":
+            png = driver.get_screenshot_as_png()
+            send_to_telegram("📱 Отсканируйте QR-код в WhatsApp Web:", png)
+            print("📤 QR отправлен в Telegram")
 
-        time.sleep(2)
+            print("⏳ Ожидаю сканирования QR...")
+            for i in range(60):
+                time.sleep(5)
+                if is_authorized():
+                    wa_ready = True
+                    print("✅ WhatsApp авторизован после QR!")
+                    send_to_telegram("✅ WhatsApp авторизован!")
+                    return
+                if i % 6 == 5:
+                    print(f"⏳ Всё ещё жду... ({(i+1)*5}с)")
 
-        try:
-            wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "span[data-testid='msg-dblcheck'], span[data-testid='msg-check']")))
-            send_to_telegram(f"✅ Сообщение успешно отправлено на {phone}")
-            return True, "Сообщение отправлено"
-        except TimeoutException:
-            if "не зарегистрирован" in driver.page_source.lower():
-                return False, "Номер не зарегистрирован в WhatsApp"
-            return False, "Не удалось подтвердить отправку"
+            send_to_telegram("❌ QR не отсканирован за 5 минут. /restart")
+            print("❌ Таймаут QR")
+
+        else:
+            png = driver.get_screenshot_as_png()
+            send_to_telegram("❌ QR не найден. Скриншот:", png)
+            print("❌ QR не найден")
 
     except Exception as e:
-        error_msg = str(e)
-        print(f"Ошибка отправки: {error_msg}")
-        if "not registered" in error_msg.lower():
-            return False, "Номер не зарегистрирован в WhatsApp"
-        return False, f"Ошибка: {error_msg}"
+        print(f"❌ Ошибка WhatsApp: {e}")
+        send_to_telegram(f"❌ Ошибка запуска WhatsApp: {e}")
 
-# ==================== BACKGROUND WA CHECK ====================
-def wa_session_worker():
-    global driver, wa_ready
-    while True:
+
+# ==================== SEND MESSAGE HELPERS ====================
+
+def find_composer():
+    """Ищет поле ввода сообщения в открытом чате."""
+    selectors = [
+        "footer div[contenteditable='true'][role='textbox']",
+        "footer div[contenteditable='true']",
+        "div[contenteditable='true'][role='textbox']",
+    ]
+    for sel in selectors:
         try:
-            if not driver:
-                print("🚀 Запуск браузера для WhatsApp...")
-                driver = get_driver()
-                driver.get("https://web.whatsapp.com")
-                ensure_wa_ready()
-                send_to_telegram("✅ WhatsApp Web сессия активна")
-            else:
-                try:
-                    driver.current_url
-                    if not wa_ready:
-                        ensure_wa_ready()
-                    else:
-                        if "web.whatsapp.com" not in driver.current_url:
-                            driver.get("https://web.whatsapp.com")
-                            time.sleep(5)
-                            ensure_wa_ready()
-                except Exception:
-                    print("⚠️ Браузер умер, перезапуск...")
-                    driver.quit()
-                    driver = None
-                    wa_ready = False
-                    driver = get_driver()
-                    driver.get("https://web.whatsapp.com")
-                    ensure_wa_ready()
-                    send_to_telegram("🔄 WhatsApp Web перезапущен")
-        except Exception as e:
-            print(f"Ошибка в wa_session_worker: {e}")
-        time.sleep(30)
+            elements = driver.find_elements(By.CSS_SELECTOR, sel)
+            for el in elements:
+                if el.is_displayed():
+                    return el
+        except Exception:
+            pass
+    return None
+
+
+def wait_for_composer(timeout=20):
+    """Ждём появления поля ввода в открытом чате."""
+    end_time = time.time() + timeout
+    while time.time() < end_time:
+        close_blocking_popups()
+        click_continue_screens()
+
+        composer = find_composer()
+        if composer:
+            return composer
+
+        time.sleep(1)
+    return None
+
+
+def open_draft_chat(phone: str, text: str):
+    """Ищет нужный черновик слева и открывает его."""
+    phone_digits = re.sub(r"\D", "", phone)
+    phone_tail10 = phone_digits[-10:] if len(phone_digits) >= 10 else phone_digits
+    phone_tail7 = phone_digits[-7:] if len(phone_digits) >= 7 else phone_digits
+
+    msg_hint = (text or "").strip().lower()
+    msg_hint_short = msg_hint[:20] if msg_hint else ""
+
+    try:
+        rows = driver.find_elements(
+            By.CSS_SELECTOR,
+            "#pane-side [role='listitem'], "
+            "#pane-side [data-testid='cell-frame-container']"
+        )
+    except Exception:
+        rows = []
+
+    print(f"[WA] Найдено строк чатов слева: {len(rows)}")
+
+    visible_rows = []
+
+    for idx, row in enumerate(rows):
+        try:
+            if not row.is_displayed():
+                continue
+
+            txt = get_element_text(row).strip().lower()
+            digits = re.sub(r"\D", "", txt)
+
+            if idx < 10:
+                print(f"[WA] row[{idx}] = {txt[:120]!r}")
+
+            visible_rows.append((row, txt, digits))
+        except Exception:
+            pass
+
+    # 1. Идеальный вариант: строка с черновиком и нашим текстом/номером
+    for row, txt, digits in visible_rows:
+        if "черновик" in txt or "draft" in txt:
+            if (msg_hint_short and msg_hint_short in txt) or \
+               (phone_tail10 and phone_tail10 in digits) or \
+               (phone_tail7 and phone_tail7 in digits):
+                print(f"[WA] ✅ Нашёл нужный черновик: {txt[:120]}")
+                click_visible(row)
+                time.sleep(2)
+                return True
+
+    # 2. Поиск по номеру
+    for row, txt, digits in visible_rows:
+        if (phone_tail10 and phone_tail10 in digits) or \
+           (phone_tail7 and phone_tail7 in digits):
+            print(f"[WA] ✅ Нашёл чат по номеру: {txt[:120]}")
+            click_visible(row)
+            time.sleep(2)
+            return True
+
+    # 3. Поиск по фрагменту текста сообщения
+    if msg_hint_short:
+        for row, txt, digits in visible_rows:
+            if msg_hint_short in txt:
+                print(f"[WA] ✅ Нашёл чат по тексту: {txt[:120]}")
+                click_visible(row)
+                time.sleep(2)
+                return True
+
+    # 4. Просто любой черновик
+    for row, txt, digits in visible_rows:
+        if "черновик" in txt or "draft" in txt:
+            print(f"[WA] ✅ Нашёл хотя бы черновик: {txt[:120]}")
+            click_visible(row)
+            time.sleep(2)
+            return True
+
+    print("[WA] ❌ Не удалось найти нужный черновик/чат")
+    return False
+
+
+def click_send_button(timeout=15):
+    """Ищет и нажимает кнопку отправки в футере чата."""
+    end_time = time.time() + timeout
+
+    while time.time() < end_time:
+        close_blocking_popups()
+
+        # 1. Селекторы внутри footer
+        selectors = [
+            "footer button[aria-label='Send']",
+            "footer button[aria-label='Отправить']",
+            "footer [data-testid='compose-btn-send']",
+            "footer button[data-testid='compose-btn-send']",
+            "footer span[data-testid='send']",
+            "footer span[data-icon='send']",
+        ]
+
+        for sel in selectors:
+            try:
+                elements = driver.find_elements(By.CSS_SELECTOR, sel)
+                for el in elements:
+                    if not el.is_displayed():
+                        continue
+                    try:
+                        parent_btn = el.find_element(
+                            By.XPATH,
+                            "./ancestor::button[1] | ./ancestor::*[@role='button'][1]"
+                        )
+                        if parent_btn.is_displayed():
+                            click_visible(parent_btn)
+                            print(f"[WA] ✅ Send через parent: {sel}")
+                            time.sleep(2)
+                            return True
+                    except Exception:
+                        pass
+
+                    click_visible(el)
+                    print(f"[WA] ✅ Send напрямую: {sel}")
+                    time.sleep(2)
+                    return True
+            except Exception:
+                pass
+
+        # 2. Без footer — глобальный поиск
+        global_selectors = [
+            "button[data-testid='compose-btn-send']",
+            "span[data-testid='send']",
+            "span[data-icon='send']",
+            "button[aria-label='Send']",
+            "button[aria-label='Отправить']",
+        ]
+
+        for sel in global_selectors:
+            try:
+                elements = driver.find_elements(By.CSS_SELECTOR, sel)
+                for el in elements:
+                    if not el.is_displayed():
+                        continue
+                    try:
+                        parent_btn = el.find_element(
+                            By.XPATH,
+                            "./ancestor::button[1] | ./ancestor::*[@role='button'][1]"
+                        )
+                        if parent_btn.is_displayed():
+                            click_visible(parent_btn)
+                            print(f"[WA] ✅ Global send через parent: {sel}")
+                            time.sleep(2)
+                            return True
+                    except Exception:
+                        pass
+
+                    click_visible(el)
+                    print(f"[WA] ✅ Global send: {sel}")
+                    time.sleep(2)
+                    return True
+            except Exception:
+                pass
+
+        # 3. JS fallback
+        try:
+            result = driver.execute_script("""
+                var icons = document.querySelectorAll('span[data-icon="send"]');
+                for (var i = 0; i < icons.length; i++) {
+                    var btn = icons[i].closest('button');
+                    if (btn && btn.offsetParent !== null) {
+                        btn.click();
+                        return true;
+                    }
+                }
+                return false;
+            """)
+            if result:
+                print("[WA] ✅ JS клик по send")
+                time.sleep(2)
+                return True
+        except Exception:
+            pass
+
+        # 4. Последняя кнопка в footer
+        try:
+            footer = driver.find_element(By.TAG_NAME, "footer")
+            btns = footer.find_elements(By.CSS_SELECTOR, "button, [role='button']")
+            visible_btns = [b for b in btns if b.is_displayed()]
+            if visible_btns:
+                last_btn = visible_btns[-1]
+                click_visible(last_btn)
+                print("[WA] ✅ Последняя кнопка в footer")
+                time.sleep(2)
+                return True
+        except Exception:
+            pass
+
+        time.sleep(1)
+
+    return False
+
+
+# ==================== SEND MESSAGE ====================
+
+def send_whatsapp(phone: str, text: str):
+    """Отправка сообщения через WhatsApp Web."""
+    phone_clean = re.sub(r"\D", "", phone)
+    # Убраны &type=phone_number&app_absent=0 – иногда они ломают поведение
+    url = f"https://web.whatsapp.com/send?phone={phone_clean}&text={quote(text)}"
+    print(f"[WA] Открываю URL: {url}")
+    driver.get(url)
+
+    # Даём странице начальную загрузку
+    time.sleep(10)  # увеличено для стабильности на Railway
+
+    # ---------- ПРОСТОЙ МЕТОД (как в локальной версии) ----------
+    # Если чат открылся нормально, просто ждём кнопку "Отправить" и кликаем
+    selectors = [
+        "button[aria-label='Отправить']",
+        "button[aria-label='Send']",
+        "span[data-testid='send']",
+        "span[data-icon='send']",
+    ]
+    for sel in selectors:
+        try:
+            btn = WebDriverWait(driver, 15).until(
+                EC.element_to_be_clickable((By.CSS_SELECTOR, sel))
+            )
+            # Используем JS-клик для надёжности
+            driver.execute_script("arguments[0].click();", btn)
+            print("[WA] ✅ Отправлено простым методом")
+            return  # Успех, выходим
+        except TimeoutException:
+            continue
+
+    print("[WA] Простой метод не сработал, перехожу к расширенному алгоритму...")
+    # -----------------------------------------------------------
+
+    # Если простой метод не сработал, выполняем всю остальную логику,
+    # которая была в вашем Railway-коде (закрытие попапов, черновики и т.д.)
+    close_blocking_popups()
+    click_continue_screens()
+    time.sleep(2)
+
+    # Проверка на ошибку номера
+    page_source = driver.page_source.lower()
+    if "phone number shared via url is invalid" in page_source:
+        raise Exception(f"Номер {phone_clean} не найден в WhatsApp")
+
+    # Скриншот для отладки
+    png_step1 = driver.get_screenshot_as_png()
+    send_to_telegram("Шаг 1: после загрузки URL", png_step1)
+
+    # Ждём открытия чата (поле ввода справа)
+    composer = wait_for_composer(timeout=10)
+
+    # Если чат не открылся — пробуем кликнуть по черновику слева
+    if not composer:
+        print("[WA] Чат справа не открылся, ищу черновик слева...")
+        png_step2 = driver.get_screenshot_as_png()
+        send_to_telegram("Шаг 2: чат не открылся, ищу черновик", png_step2)
+        opened = open_draft_chat(phone_clean, text)
+        if opened:
+            time.sleep(2)
+            close_blocking_popups()
+            composer = wait_for_composer(timeout=10)
+
+    # Если всё ещё нет — сдаёмся
+    if not composer:
+        png_fail = driver.get_screenshot_as_png()
+        send_to_telegram("❌ Чат не открылся. Скриншот:", png_fail)
+        raise Exception("Чат не открылся для отправки")
+
+    print("[WA] ✅ Поле ввода найдено")
+    png_step3 = driver.get_screenshot_as_png()
+    send_to_telegram("Шаг 3: поле ввода найдено", png_step3)
+
+    # Нажимаем кнопку отправки
+    sent = click_send_button(timeout=15)
+    if sent:
+        print("[WA] ✅ Сообщение отправлено!")
+        return
+
+    # Fallback: фокус на composer + Enter
+    print("[WA] Кнопка send не найдена, пробую Enter...")
+    try:
+        click_visible(composer)
+        time.sleep(1)
+        composer.send_keys(Keys.ENTER)
+        print("[WA] ⚠️ Fallback: Enter в composer")
+        time.sleep(2)
+        png_step4 = driver.get_screenshot_as_png()
+        send_to_telegram("Шаг 4: после Enter", png_step4)
+        return
+    except Exception as e:
+        print(f"[WA] Enter тоже не сработал: {e}")
+        png_final = driver.get_screenshot_as_png()
+        send_to_telegram("❌ Не удалось отправить. Скриншот:", png_final)
+        raise Exception("Не удалось отправить сообщение")
+
 
 # ==================== TELEGRAM HANDLERS ====================
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if user_id != OWNER_ID:
-        await update.message.reply_text("⛔ Доступ запрещён.")
+
+async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != OWNER_ID:
         return
+    status = "✅ готов" if wa_ready else "⏳ ожидает авторизации"
     await update.message.reply_text(
-        "🤖 WhatsApp Bot активен\n"
-        "📌 Команды владельца:\n"
-        "/wa 79123456789 Текст — быстрое сообщение\n"
-        "/list — список всех номеров (файл)\n"
-        "/unsent — количество неотправленных\n"
-        "/broadcast Текст — рассылка по всем неотправленным\n"
-        "/reset — сбросить статусы отправки\n\n"
-        "📥 Любой пользователь может прислать номер или PDF с номерами — они сохранятся."
+        f"Статус WhatsApp: {status}\n\n"
+        "Формат: +79151234567 Текст сообщения\n\n"
+        "Команды:\n"
+        "/start — статус\n"
+        "/debug — скриншот браузера\n"
+        "/restart — перезапуск WhatsApp"
     )
 
-async def wa_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if user_id != OWNER_ID:
-        await update.message.reply_text("⛔ Доступ запрещён.")
+
+async def debug_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != OWNER_ID:
         return
-
-    if not context.args:
-        await update.message.reply_text("❌ Пример: /wa 79123456789 Текст сообщения")
+    if not driver:
+        await update.message.reply_text("❌ Браузер не запущен")
         return
-
-    phone = context.args[0]
-    message = " ".join(context.args[1:])
-    if not message:
-        await update.message.reply_text("❌ Введите текст сообщения")
-        return
-
-    await update.message.reply_text(f"📤 Отправляю сообщение на {phone}...")
-
-    def send_in_thread():
-        success, result = send_whatsapp(phone, message)
-        if success:
-            asyncio.run_coroutine_threadsafe(
-                update.message.reply_text(f"✅ {result} на {phone}"),
-                main_loop
-            )
-        else:
-            asyncio.run_coroutine_threadsafe(
-                update.message.reply_text(f"❌ {result}"),
-                main_loop
-            )
-
-    thread = threading.Thread(target=send_in_thread)
-    thread.start()
-
-async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработка текста от любого пользователя."""
-    user_id = update.effective_user.id
-    text = update.message.text.strip()
-    if text.startswith('/'):
-        return
-
-    # 1. Проверяем старый формат для владельца: "номер текст"
-    if user_id == OWNER_ID:
-        parts = text.split(maxsplit=1)
-        if len(parts) == 2:
-            phone_candidate = parts[0]
-            msg_text = parts[1]
-            phone = clean_russian_phone(phone_candidate)
-            if phone:
-                # Отправляем сразу
-                await update.message.reply_text(f"📤 Отправляю на {phone}...")
-                def send_old():
-                    success, result = send_whatsapp(phone, msg_text)
-                    if success:
-                        asyncio.run_coroutine_threadsafe(
-                            update.message.reply_text(f"✅ {result} на {phone}"),
-                            main_loop
-                        )
-                    else:
-                        asyncio.run_coroutine_threadsafe(
-                            update.message.reply_text(f"❌ {result}"),
-                            main_loop
-                        )
-                threading.Thread(target=send_old).start()
-                return
-
-    # 2. Для всех (и владельца тоже) извлекаем номера из текста
-    numbers = extract_russian_phones(text)
-    if numbers:
-        saved = 0
-        for num in numbers:
-            if add_number(num, user_id):
-                saved += 1
-        reply = f"✅ Сохранено номеров: {saved}"
-        if saved < len(numbers):
-            reply += " (дубликаты пропущены)"
-        await update.message.reply_text(reply)
-    else:
-        # Нет номеров — для не-владельца молчим, владельцу подскажем
-        if user_id == OWNER_ID:
-            await update.message.reply_text("❌ Не найдено российских номеров в сообщении.")
-
-async def handle_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработка PDF-файлов от любого пользователя."""
-    user_id = update.effective_user.id
-    document = update.message.document
-    if not document.file_name.lower().endswith('.pdf'):
-        return
-
     try:
-        file = await document.get_file()
-        buf = io.BytesIO()
-        await file.download_to_memory(buf)
-        buf.seek(0)
-
-        reader = PdfReader(buf)
-        full_text = ""
-        for page in reader.pages:
-            page_text = page.extract_text()
-            if page_text:
-                full_text += page_text + "\n"
-
-        numbers = extract_russian_phones(full_text)
-        if numbers:
-            saved = 0
-            for num in numbers:
-                if add_number(num, user_id):
-                    saved += 1
-            reply = f"✅ Из PDF сохранено номеров: {saved}"
-            if saved < len(numbers):
-                reply += " (дубликаты пропущены)"
-            await update.message.reply_text(reply)
-        else:
-            await update.message.reply_text("❌ В PDF не найдено российских номеров.")
+        png = driver.get_screenshot_as_png()
+        url = driver.current_url
+        await update.message.reply_photo(png, caption=f"🔍 URL: {url}")
     except Exception as e:
-        await update.message.reply_text(f"❌ Ошибка обработки PDF: {e}")
+        await update.message.reply_text(f"❌ Ошибка скриншота: {e}")
 
-# ---------- команды владельца для рассылки ----------
-async def cmd_unsent(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+async def restart_wa_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != OWNER_ID:
         return
-    total, unsent = get_stats()
-    await update.message.reply_text(f"📊 Всего номеров: {total}\n📬 Ещё не отправлено: {unsent}")
+    global driver, wa_ready
+    await update.message.reply_text("🔄 Перезапускаю WhatsApp...")
+    wa_ready = False
+    if driver:
+        try:
+            driver.quit()
+        except Exception:
+            pass
+    threading.Thread(target=start_whatsapp, daemon=True).start()
 
-async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != OWNER_ID:
         return
-    rows = get_all_numbers()
-    if not rows:
-        await update.message.reply_text("База номеров пуста.")
-        return
-    lines = ["phone,sent"]
-    for phone, sent in rows:
-        lines.append(f"{phone},{sent}")
-    csv_data = "\n".join(lines)
-    buf = io.BytesIO(csv_data.encode('utf-8'))
-    buf.name = "numbers.csv"
-    await update.message.reply_document(buf, caption=f"Всего номеров: {len(rows)}")
-
-async def cmd_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != OWNER_ID:
-        return
-    if not context.args:
-        await update.message.reply_text("❌ Укажите текст рассылки.\nПример: /broadcast Здравствуйте, это тест.")
-        return
-    message_text = " ".join(context.args)
-    unsent = get_unsent_numbers()
-    if not unsent:
-        await update.message.reply_text("Все номера уже обработаны. /reset для сброса.")
-        return
-
-    await update.message.reply_text(f"🚀 Запущена рассылка на {len(unsent)} номеров...")
-    success_count = 0
-    fail_count = 0
-
-    def broadcast_thread():
-        nonlocal success_count, fail_count
-        for phone in unsent:
-            success, result = send_whatsapp(phone, message_text)
-            if success:
-                mark_sent(phone)
-                success_count += 1
-            else:
-                fail_count += 1
-            # Отправляем прогресс каждые 10 номеров
-            if (success_count + fail_count) % 10 == 0:
-                asyncio.run_coroutine_threadsafe(
-                    update.message.reply_text(
-                        f"⏳ Прогресс: отправлено {success_count}, ошибок {fail_count} из {len(unsent)}"
-                    ),
-                    main_loop
-                )
-        # Финальное сообщение
-        asyncio.run_coroutine_threadsafe(
-            update.message.reply_text(
-                f"✅ Рассылка завершена.\nУспешно: {success_count}\nОшибок: {fail_count}\nВсего: {len(unsent)}"
-            ),
-            main_loop
+    if not wa_ready:
+        await update.message.reply_text(
+            "⏳ WhatsApp не готов.\n"
+            "Используйте /restart для повторной попытки."
         )
-    threading.Thread(target=broadcast_thread).start()
-
-async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != OWNER_ID:
         return
-    reset_all_sent()
-    await update.message.reply_text("♻️ Статусы отправки сброшены. Все номера снова доступны для рассылки.")
+    m = re.match(r"^(\+\d{10,15})\s+(.+)$", update.message.text.strip(), re.S)
+    if not m:
+        await update.message.reply_text("Формат: +79151234567 Текст сообщения")
+        return
+    phone, msg = m.groups()
+    await update.message.reply_text(f"📤 Отправляю на {phone}...")
+    try:
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, send_whatsapp, phone, msg)
+        await update.message.reply_text("✅ Отправлено!")
+    except Exception as e:
+        await update.message.reply_text(f"❌ Ошибка: {e}")
+
 
 # ==================== MAIN ====================
+
 def main():
     global bot_app, main_loop
 
-    init_db()
+    if not TOKEN:
+        print("❌ Нет TELEGRAM_TOKEN")
+        return
 
-    wa_thread = threading.Thread(target=wa_session_worker, daemon=True)
-    wa_thread.start()
+    import requests as req
+    for attempt in range(3):
+        try:
+            r = req.get(
+                f"https://api.telegram.org/bot{TOKEN}/deleteWebhook"
+                f"?drop_pending_updates=True",
+                timeout=10
+            )
+            if r.status_code == 200:
+                print("✅ Вебхук сброшен")
+                break
+        except Exception as e:
+            print(f"⚠️ Попытка {attempt+1}: {e}")
+            time.sleep(3)
 
-    bot_app = Application.builder().token(TOKEN).build()
-    main_loop = asyncio.get_event_loop()
+    from telegram.request import HTTPXRequest
+    request = HTTPXRequest(
+        connection_pool_size=8,
+        read_timeout=30,
+        write_timeout=30,
+        connect_timeout=30,
+        pool_timeout=30,
+    )
 
-    # Регистрируем обработчики
-    bot_app.add_handler(CommandHandler("start", start))
-    bot_app.add_handler(CommandHandler("wa", wa_command))
-    bot_app.add_handler(CommandHandler("unsent", cmd_unsent))
-    bot_app.add_handler(CommandHandler("list", cmd_list))
-    bot_app.add_handler(CommandHandler("broadcast", cmd_broadcast))
-    bot_app.add_handler(CommandHandler("reset", cmd_reset))
+    bot_app = (
+        Application.builder()
+        .token(TOKEN)
+        .request(request)
+        .build()
+    )
 
-    bot_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
-    bot_app.add_handler(MessageHandler(filters.Document.PDF, handle_pdf))
+    bot_app.add_handler(CommandHandler("start", start_cmd))
+    bot_app.add_handler(CommandHandler("debug", debug_cmd))
+    bot_app.add_handler(CommandHandler("restart", restart_wa_cmd))
+    bot_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
 
-    print("🤖 Бот запущен")
-    bot_app.run_polling()
+    main_loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(main_loop)
+
+    threading.Thread(target=start_whatsapp, daemon=True).start()
+
+    print("🚀 Бот запущен")
+    bot_app.run_polling(
+        drop_pending_updates=True,
+        allowed_updates=["message"],
+        poll_interval=2.0,
+        timeout=20,
+    )
+
 
 if __name__ == "__main__":
     main()
