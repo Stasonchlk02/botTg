@@ -65,14 +65,17 @@ def extract_phones(text: str) -> list[str]:
         norm = normalize_phone(raw)
         if norm:
             phones.append(norm)
-    # убираем дубликаты, сохраняя порядок
     return list(dict.fromkeys(phones))
 
-def add_phones(phones: list[str], user_id: int) -> int:
-    """Добавляет новые номера в базу, возвращает количество действительно новых."""
+def add_phones(phones: list[str], user_id: int) -> tuple[int, int]:
+    """
+    Добавляет номера в базу.
+    Возвращает (добавлено новых, всего уникальных передано).
+    """
+    unique_phones = list(dict.fromkeys(phones))
     new_count = 0
     with sqlite3.connect(DB_PATH) as conn:
-        for phone in phones:
+        for phone in unique_phones:
             try:
                 conn.execute(
                     "INSERT INTO phones (phone, added_by) VALUES (?, ?)",
@@ -82,7 +85,34 @@ def add_phones(phones: list[str], user_id: int) -> int:
             except sqlite3.IntegrityError:
                 pass
         conn.commit()
-    return new_count
+    return new_count, len(unique_phones)
+
+def delete_phones(phones: list[str]) -> int:
+    """Удаляет указанные номера из базы. Возвращает количество удалённых."""
+    if not phones:
+        return 0
+    with sqlite3.connect(DB_PATH) as conn:
+        placeholders = ','.join('?' for _ in phones)
+        cur = conn.execute(
+            f"DELETE FROM phones WHERE phone IN ({placeholders})",
+            phones
+        )
+        conn.commit()
+        return cur.rowcount
+
+def delete_sent_phones() -> int:
+    """Удаляет все номера с sent=1. Возвращает количество удалённых."""
+    with sqlite3.connect(DB_PATH) as conn:
+        cur = conn.execute("DELETE FROM phones WHERE sent = 1")
+        conn.commit()
+        return cur.rowcount
+
+def delete_all_phones() -> int:
+    """Удаляет все номера. Возвращает количество удалённых."""
+    with sqlite3.connect(DB_PATH) as conn:
+        cur = conn.execute("DELETE FROM phones")
+        conn.commit()
+        return cur.rowcount
 
 def get_unsent_phones() -> list[str]:
     """Номера, для которых ещё не было отправки (sent=0)."""
@@ -118,7 +148,7 @@ def reset_all_sent():
         conn.execute("UPDATE phones SET sent = 0, sent_at = NULL")
         conn.commit()
 
-# -------------------- BROWSER / SELENIUM (оригинал без изменений) --------------------
+# -------------------- BROWSER / SELENIUM (ВАШ ОРИГИНАЛЬНЫЙ КОД БЕЗ ИЗМЕНЕНИЙ) --------------------
 def get_driver():
     options = Options()
     options.add_argument(f"--user-data-dir={SESSION_DIR}")
@@ -704,14 +734,17 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     status = "✅ готов" if wa_ready else "⏳ ожидает авторизации"
     await update.message.reply_text(
         f"Статус WhatsApp: {status}\n\n"
-        "Отправьте номер или PDF с номерами — они сохранятся.\n\n"
-        "Команды для владельца:\n"
-        "/send 7916...,7926... Текст — отправить конкретным\n"
-        "/broadcast Текст — отправить всем неотправленным\n"
+        "📱 Отправьте номер или PDF с номерами — они сохранятся.\n\n"
+        "👑 Команды владельца:\n"
+        "/send номера Текст — отправка конкретным\n"
+        "/broadcast Текст — рассылка всем неотправленным\n"
         "/stats — статистика\n"
         "/list — неотправленные номера\n"
-        "/reset 7916... — сбросить статус номера\n"
-        "/reset_all — сбросить всё\n"
+        "/reset номер — сбросить статус\n"
+        "/reset_all — сбросить статус всем\n"
+        "/delete номера — удалить номера (через запятую)\n"
+        "/delete_sent — удалить отправленные номера\n"
+        "/delete_all confirm — удалить ВСЕ номера (осторожно!)\n"
         "/debug — скриншот браузера\n"
         "/restart — перезапуск WhatsApp"
     )
@@ -764,11 +797,12 @@ async def send_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Не найдено ни одного корректного российского номера")
         return
 
-    added = add_phones(phones, OWNER_ID)
-    if added:
-        await update.message.reply_text(f"➕ Добавлено новых номеров: {added}")
+    added, total = add_phones(phones, OWNER_ID)
+    await update.message.reply_text(
+        f"📤 Начинаю отправку на {len(phones)} номер(ов)\n"
+        f"(➕ новых в базе: {added}, уже было: {total - added})"
+    )
 
-    await update.message.reply_text(f"📤 Начинаю отправку на {len(phones)} номер(ов)...")
     for phone in phones:
         try:
             loop = asyncio.get_running_loop()
@@ -809,23 +843,25 @@ async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != OWNER_ID:
         return
     total, sent, unsent = get_stats()
+    pct = (sent / total * 100) if total > 0 else 0
     await update.message.reply_text(
         f"📊 Статистика номеров:\n"
-        f"• Всего: {total}\n"
-        f"• Отправлено: {sent}\n"
-        f"• Осталось: {unsent}"
+        f"• Всего в базе: {total}\n"
+        f"• Отправлено: {sent} ({pct:.1f}%)\n"
+        f"• Осталось отправить: {unsent}"
     )
 
 async def list_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != OWNER_ID:
         return
-    phones = get_unsent_phones()
-    if not phones:
-        await update.message.reply_text("Все номера уже отправлены.")
+    total, sent, unsent = get_stats()
+    if unsent == 0:
+        await update.message.reply_text("✅ Все номера уже отправлены!")
         return
-    text = "📋 Неотправленные номера:\n" + "\n".join(phones[:50])
+    phones = get_unsent_phones()
+    text = f"📋 Неотправленные номера (всего {unsent}):\n" + "\n".join(phones[:50])
     if len(phones) > 50:
-        text += f"\n... и ещё {len(phones) - 50}"
+        text += f"\n\n... и ещё {len(phones) - 50} (показаны первые 50)"
     await update.message.reply_text(text)
 
 async def reset_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -839,7 +875,7 @@ async def reset_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Некорректный номер")
         return
     if reset_sent(phone):
-        await update.message.reply_text(f"✅ Статус для {phone} сброшен")
+        await update.message.reply_text(f"✅ Статус для {phone} сброшен (теперь не отправлен)")
     else:
         await update.message.reply_text("Номер не найден в базе")
 
@@ -847,19 +883,58 @@ async def reset_all_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != OWNER_ID:
         return
     reset_all_sent()
-    await update.message.reply_text("✅ Статус отправки сброшен для всех номеров")
+    total, _, _ = get_stats()
+    await update.message.reply_text(f"✅ Статус отправки сброшен для всех {total} номеров")
+
+async def delete_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Удаляет указанные номера (через запятую)."""
+    if update.effective_user.id != OWNER_ID:
+        return
+    if not context.args:
+        await update.message.reply_text("Формат: /delete 79161234567,79261234567")
+        return
+    raw_phones = context.args[0].split(",")
+    phones_to_delete = []
+    for rp in raw_phones:
+        norm = normalize_phone(rp.strip())
+        if norm:
+            phones_to_delete.append(norm)
+    if not phones_to_delete:
+        await update.message.reply_text("Не найдено корректных номеров для удаления")
+        return
+    deleted = delete_phones(phones_to_delete)
+    await update.message.reply_text(f"🗑 Удалено номеров: {deleted} из {len(phones_to_delete)} указанных")
+
+async def delete_sent_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Удаляет все номера, которые уже были отправлены."""
+    if update.effective_user.id != OWNER_ID:
+        return
+    deleted = delete_sent_phones()
+    await update.message.reply_text(f"🗑 Удалено отправленных номеров: {deleted}")
+
+async def delete_all_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Удаляет всю базу номеров. Требует подтверждения через аргумент 'confirm'."""
+    if update.effective_user.id != OWNER_ID:
+        return
+    if not context.args or context.args[0].lower() != "confirm":
+        await update.message.reply_text(
+            "⚠️ Вы собираетесь удалить ВСЕ номера из базы.\n"
+            "Для подтверждения введите: /delete_all confirm"
+        )
+        return
+    deleted = delete_all_phones()
+    await update.message.reply_text(f"🗑 База очищена. Удалено номеров: {deleted}")
 
 async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обрабатывает входящий текст: либо команда отправки для владельца, либо извлечение номеров."""
+    """Обрабатывает входящий текст: извлечение номеров ИЛИ быстрая отправка для владельца."""
     msg_text = update.message.text.strip()
-    # Если владелец и сообщение соответствует формату быстрой отправки
+    # Быстрая отправка для владельца: +79161234567 Текст
     if update.effective_user.id == OWNER_ID:
         m = re.match(r"^(\+\d{10,15})\s+(.+)$", msg_text, re.S)
         if m:
             phone_raw, text = m.groups()
             norm = normalize_phone(phone_raw)
             if norm:
-                # Сохраняем номер и отправляем
                 add_phones([norm], OWNER_ID)
                 await update.message.reply_text(f"📤 Отправляю на {norm}...")
                 try:
@@ -874,13 +949,17 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_text("Некорректный номер телефона")
                 return
 
-    # Для всех (включая владельца, если формат не совпал) – извлечение номеров
+    # Для всех: извлечение номеров из текста
     phones = extract_phones(msg_text)
     if not phones:
         await update.message.reply_text("❌ Российские номера не найдены.")
         return
-    new = add_phones(phones, update.effective_user.id)
-    await update.message.reply_text(f"✅ Найдено номеров: {len(phones)}. Добавлено новых: {new}.")
+    new, total = add_phones(phones, update.effective_user.id)
+    await update.message.reply_text(
+        f"✅ Найдено номеров: {total}. "
+        f"Добавлено новых: {new}" +
+        (f" (уже были в базе: {total - new})" if total - new > 0 else "")
+    )
 
 async def pdf_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обрабатывает PDF-файл, извлекает номера."""
@@ -912,8 +991,12 @@ async def pdf_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("❌ Российские номера в PDF не найдены.")
             return
 
-        new = add_phones(phones, update.effective_user.id)
-        await update.message.reply_text(f"✅ Из PDF извлечено номеров: {len(phones)}. Добавлено новых: {new}.")
+        new, total = add_phones(phones, update.effective_user.id)
+        await update.message.reply_text(
+            f"✅ Из PDF извлечено номеров: {total}. "
+            f"Добавлено новых: {new}" +
+            (f" (уже были в базе: {total - new})" if total - new > 0 else "")
+        )
     except Exception as e:
         await update.message.reply_text(f"❌ Ошибка при обработке PDF: {e}")
 
@@ -963,15 +1046,18 @@ def main():
     bot_app.add_handler(CommandHandler("debug", debug_cmd))
     bot_app.add_handler(CommandHandler("restart", restart_wa_cmd))
 
-    # Новые команды рассылки и управления номерами
+    # Новые команды рассылки и управления
     bot_app.add_handler(CommandHandler("send", send_cmd))
     bot_app.add_handler(CommandHandler("broadcast", broadcast_cmd))
     bot_app.add_handler(CommandHandler("stats", stats_cmd))
     bot_app.add_handler(CommandHandler("list", list_cmd))
     bot_app.add_handler(CommandHandler("reset", reset_cmd))
     bot_app.add_handler(CommandHandler("reset_all", reset_all_cmd))
+    bot_app.add_handler(CommandHandler("delete", delete_cmd))
+    bot_app.add_handler(CommandHandler("delete_sent", delete_sent_cmd))
+    bot_app.add_handler(CommandHandler("delete_all", delete_all_cmd))
 
-    # Приём номеров: текст (быстрая отправка для владельца + извлечение для всех)
+    # Приём номеров: текст и PDF
     bot_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
     bot_app.add_handler(MessageHandler(filters.Document.PDF, pdf_handler))
 
