@@ -3,7 +3,9 @@ import os
 import re
 import time
 import threading
+import sqlite3
 from urllib.parse import quote
+from io import BytesIO
 
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
@@ -14,21 +16,109 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.common.keys import Keys
-from selenium.webdriver.common.action_chains import ActionChains
 from selenium.common.exceptions import TimeoutException
 
+from pypdf import PdfReader
+
+# -------------------- КОНФИГУРАЦИЯ --------------------
 TOKEN = os.getenv("TELEGRAM_TOKEN")
 OWNER_ID = int(os.getenv("OWNER_ID", "1636373767"))
 SESSION_DIR = "/app/chrome_session"
+DB_PATH = "/app/data/phones.db"
 
 driver = None
 wa_ready = False
 bot_app = None
 main_loop = None
 
+# -------------------- БАЗА ДАННЫХ --------------------
+def init_db():
+    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS phones (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                phone TEXT UNIQUE NOT NULL,
+                added_by INTEGER,
+                added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                sent INTEGER DEFAULT 0,
+                sent_at TIMESTAMP
+            )
+        """)
+        conn.commit()
 
-# ==================== BROWSER ====================
+def normalize_phone(raw: str) -> str | None:
+    """Приводит российский номер к формату 79XXXXXXXXX (11 цифр)."""
+    digits = re.sub(r"\D", "", raw)
+    if len(digits) == 11 and digits[0] in "78":
+        if digits[0] == "8":
+            digits = "7" + digits[1:]
+        return digits
+    return None
 
+def extract_phones(text: str) -> list[str]:
+    """Извлекает все российские номера из текста (разные форматы)."""
+    pattern = r'(?:\+7|8)[\s\-]?\(?\d{3}\)?[\s\-]?\d{3}[\s\-]?\d{2}[\s\-]?\d{2}'
+    raw_matches = re.findall(pattern, text)
+    phones = []
+    for raw in raw_matches:
+        norm = normalize_phone(raw)
+        if norm:
+            phones.append(norm)
+    # убираем дубликаты, сохраняя порядок
+    return list(dict.fromkeys(phones))
+
+def add_phones(phones: list[str], user_id: int) -> int:
+    """Добавляет новые номера в базу, возвращает количество действительно новых."""
+    new_count = 0
+    with sqlite3.connect(DB_PATH) as conn:
+        for phone in phones:
+            try:
+                conn.execute(
+                    "INSERT INTO phones (phone, added_by) VALUES (?, ?)",
+                    (phone, user_id)
+                )
+                new_count += 1
+            except sqlite3.IntegrityError:
+                pass
+        conn.commit()
+    return new_count
+
+def get_unsent_phones() -> list[str]:
+    """Номера, для которых ещё не было отправки (sent=0)."""
+    with sqlite3.connect(DB_PATH) as conn:
+        rows = conn.execute(
+            "SELECT phone FROM phones WHERE sent = 0 ORDER BY added_at"
+        ).fetchall()
+        return [row[0] for row in rows]
+
+def mark_sent(phone: str):
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute(
+            "UPDATE phones SET sent = 1, sent_at = CURRENT_TIMESTAMP WHERE phone = ?",
+            (phone,)
+        )
+        conn.commit()
+
+def get_stats() -> tuple[int, int, int]:
+    with sqlite3.connect(DB_PATH) as conn:
+        total = conn.execute("SELECT COUNT(*) FROM phones").fetchone()[0]
+        sent = conn.execute("SELECT COUNT(*) FROM phones WHERE sent = 1").fetchone()[0]
+        unsent = total - sent
+        return total, sent, unsent
+
+def reset_sent(phone: str) -> bool:
+    with sqlite3.connect(DB_PATH) as conn:
+        cur = conn.execute("UPDATE phones SET sent = 0, sent_at = NULL WHERE phone = ?", (phone,))
+        conn.commit()
+        return cur.rowcount > 0
+
+def reset_all_sent():
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute("UPDATE phones SET sent = 0, sent_at = NULL")
+        conn.commit()
+
+# -------------------- BROWSER / SELENIUM (оригинал без изменений) --------------------
 def get_driver():
     options = Options()
     options.add_argument(f"--user-data-dir={SESSION_DIR}")
@@ -53,9 +143,6 @@ def get_driver():
     )
     return webdriver.Chrome(service=service, options=options)
 
-
-# ==================== TELEGRAM HELPER ====================
-
 def send_to_telegram(text, photo=None):
     if not bot_app or not main_loop:
         print(f"[WA→TG] bot_app или main_loop не готов: {text}")
@@ -70,11 +157,7 @@ def send_to_telegram(text, photo=None):
     except Exception as e:
         print(f"[send_to_telegram] Ошибка: {e}")
 
-
-# ==================== POPUP / DIALOG HELPERS ====================
-
 def get_element_text(el):
-    """Надёжно получает текст элемента через JS."""
     try:
         txt = driver.execute_script("""
             return (arguments[0].innerText || arguments[0].textContent || '').trim();
@@ -86,9 +169,7 @@ def get_element_text(el):
         except Exception:
             return ""
 
-
 def click_visible(el):
-    """Надёжный клик по элементу."""
     try:
         driver.execute_script(
             "arguments[0].scrollIntoView({block: 'center'});", el
@@ -101,9 +182,7 @@ def click_visible(el):
     except Exception:
         driver.execute_script("arguments[0].click();", el)
 
-
 def close_dialog_if_exists():
-    """Закрывает div[role='dialog'] если он есть."""
     try:
         dialogs = driver.find_elements(By.CSS_SELECTOR, "div[role='dialog']")
         for dialog in dialogs:
@@ -129,9 +208,7 @@ def close_dialog_if_exists():
     except Exception as e:
         print(f"[close_dialog] Ошибка: {e}")
 
-
 def close_blocking_popups():
-    """Закрывает мешающие окна WhatsApp Web."""
     if not driver:
         return
 
@@ -189,9 +266,7 @@ def close_blocking_popups():
         if not closed_any:
             break
 
-
 def click_continue_screens():
-    """Закрывает промежуточные экраны типа Continue to chat."""
     texts = [
         "Continue to chat",
         "Продолжить чат",
@@ -225,9 +300,6 @@ def click_continue_screens():
 
     return clicked
 
-
-# ==================== WHATSAPP AUTH ====================
-
 def is_authorized():
     try:
         close_blocking_popups()
@@ -243,7 +315,6 @@ def is_authorized():
         return False
     except Exception:
         return False
-
 
 def wait_for_qr():
     qr_selectors = [
@@ -269,7 +340,6 @@ def wait_for_qr():
         print(f"[{attempt+1}/20] Ожидание QR или авторизации...")
 
     return "timeout"
-
 
 def start_whatsapp():
     global driver, wa_ready
@@ -326,11 +396,7 @@ def start_whatsapp():
         print(f"❌ Ошибка WhatsApp: {e}")
         send_to_telegram(f"❌ Ошибка запуска WhatsApp: {e}")
 
-
-# ==================== SEND MESSAGE HELPERS ====================
-
 def find_composer():
-    """Ищет поле ввода сообщения в открытом чате."""
     selectors = [
         "footer div[contenteditable='true'][role='textbox']",
         "footer div[contenteditable='true']",
@@ -346,9 +412,7 @@ def find_composer():
             pass
     return None
 
-
 def wait_for_composer(timeout=20):
-    """Ждём появления поля ввода в открытом чате."""
     end_time = time.time() + timeout
     while time.time() < end_time:
         close_blocking_popups()
@@ -361,9 +425,7 @@ def wait_for_composer(timeout=20):
         time.sleep(1)
     return None
 
-
 def open_draft_chat(phone: str, text: str):
-    """Ищет нужный черновик слева и открывает его."""
     phone_digits = re.sub(r"\D", "", phone)
     phone_tail10 = phone_digits[-10:] if len(phone_digits) >= 10 else phone_digits
     phone_tail7 = phone_digits[-7:] if len(phone_digits) >= 7 else phone_digits
@@ -439,9 +501,7 @@ def open_draft_chat(phone: str, text: str):
     print("[WA] ❌ Не удалось найти нужный черновик/чат")
     return False
 
-
 def click_send_button(timeout=15):
-    """Ищет и нажимает кнопку отправки в футере чата."""
     end_time = time.time() + timeout
 
     while time.time() < end_time:
@@ -556,22 +616,15 @@ def click_send_button(timeout=15):
 
     return False
 
-
-# ==================== SEND MESSAGE ====================
-
 def send_whatsapp(phone: str, text: str):
-    """Отправка сообщения через WhatsApp Web."""
     phone_clean = re.sub(r"\D", "", phone)
-    # Убраны &type=phone_number&app_absent=0 – иногда они ломают поведение
     url = f"https://web.whatsapp.com/send?phone={phone_clean}&text={quote(text)}"
     print(f"[WA] Открываю URL: {url}")
     driver.get(url)
 
-    # Даём странице начальную загрузку
-    time.sleep(10)  # увеличено для стабильности на Railway
+    time.sleep(10)
 
-    # ---------- ПРОСТОЙ МЕТОД (как в локальной версии) ----------
-    # Если чат открылся нормально, просто ждём кнопку "Отправить" и кликаем
+    # Простой метод – ждём кнопку Отправить
     selectors = [
         "button[aria-label='Отправить']",
         "button[aria-label='Send']",
@@ -583,35 +636,26 @@ def send_whatsapp(phone: str, text: str):
             btn = WebDriverWait(driver, 15).until(
                 EC.element_to_be_clickable((By.CSS_SELECTOR, sel))
             )
-            # Используем JS-клик для надёжности
             driver.execute_script("arguments[0].click();", btn)
             print("[WA] ✅ Отправлено простым методом")
-            return  # Успех, выходим
+            return
         except TimeoutException:
             continue
 
     print("[WA] Простой метод не сработал, перехожу к расширенному алгоритму...")
-    # -----------------------------------------------------------
-
-    # Если простой метод не сработал, выполняем всю остальную логику,
-    # которая была в вашем Railway-коде (закрытие попапов, черновики и т.д.)
     close_blocking_popups()
     click_continue_screens()
     time.sleep(2)
 
-    # Проверка на ошибку номера
     page_source = driver.page_source.lower()
     if "phone number shared via url is invalid" in page_source:
         raise Exception(f"Номер {phone_clean} не найден в WhatsApp")
 
-    # Скриншот для отладки
     png_step1 = driver.get_screenshot_as_png()
     send_to_telegram("Шаг 1: после загрузки URL", png_step1)
 
-    # Ждём открытия чата (поле ввода справа)
     composer = wait_for_composer(timeout=10)
 
-    # Если чат не открылся — пробуем кликнуть по черновику слева
     if not composer:
         print("[WA] Чат справа не открылся, ищу черновик слева...")
         png_step2 = driver.get_screenshot_as_png()
@@ -622,7 +666,6 @@ def send_whatsapp(phone: str, text: str):
             close_blocking_popups()
             composer = wait_for_composer(timeout=10)
 
-    # Если всё ещё нет — сдаёмся
     if not composer:
         png_fail = driver.get_screenshot_as_png()
         send_to_telegram("❌ Чат не открылся. Скриншот:", png_fail)
@@ -632,7 +675,6 @@ def send_whatsapp(phone: str, text: str):
     png_step3 = driver.get_screenshot_as_png()
     send_to_telegram("Шаг 3: поле ввода найдено", png_step3)
 
-    # Нажимаем кнопку отправки
     sent = click_send_button(timeout=15)
     if sent:
         print("[WA] ✅ Сообщение отправлено!")
@@ -655,22 +697,24 @@ def send_whatsapp(phone: str, text: str):
         send_to_telegram("❌ Не удалось отправить. Скриншот:", png_final)
         raise Exception("Не удалось отправить сообщение")
 
-
-# ==================== TELEGRAM HANDLERS ====================
-
+# -------------------- TELEGRAM HANDLERS --------------------
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != OWNER_ID:
         return
     status = "✅ готов" if wa_ready else "⏳ ожидает авторизации"
     await update.message.reply_text(
         f"Статус WhatsApp: {status}\n\n"
-        "Формат: +79151234567 Текст сообщения\n\n"
-        "Команды:\n"
-        "/start — статус\n"
+        "Отправьте номер или PDF с номерами — они сохранятся.\n\n"
+        "Команды для владельца:\n"
+        "/send 7916...,7926... Текст — отправить конкретным\n"
+        "/broadcast Текст — отправить всем неотправленным\n"
+        "/stats — статистика\n"
+        "/list — неотправленные номера\n"
+        "/reset 7916... — сбросить статус номера\n"
+        "/reset_all — сбросить всё\n"
         "/debug — скриншот браузера\n"
         "/restart — перезапуск WhatsApp"
     )
-
 
 async def debug_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != OWNER_ID:
@@ -685,7 +729,6 @@ async def debug_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         await update.message.reply_text(f"❌ Ошибка скриншота: {e}")
 
-
 async def restart_wa_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != OWNER_ID:
         return
@@ -699,38 +742,190 @@ async def restart_wa_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pass
     threading.Thread(target=start_whatsapp, daemon=True).start()
 
-
-async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def send_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != OWNER_ID:
         return
-    if not wa_ready:
-        await update.message.reply_text(
-            "⏳ WhatsApp не готов.\n"
-            "Используйте /restart для повторной попытки."
-        )
+    if not context.args:
+        await update.message.reply_text("Формат: /send номер1,номер2 Текст сообщения")
         return
-    m = re.match(r"^(\+\d{10,15})\s+(.+)$", update.message.text.strip(), re.S)
-    if not m:
-        await update.message.reply_text("Формат: +79151234567 Текст сообщения")
+
+    raw_phones = context.args[0].split(",")
+    text = " ".join(context.args[1:]) if len(context.args) > 1 else ""
+    if not text:
+        await update.message.reply_text("Укажите текст сообщения после номеров")
         return
-    phone, msg = m.groups()
-    await update.message.reply_text(f"📤 Отправляю на {phone}...")
+
+    phones = []
+    for rp in raw_phones:
+        norm = normalize_phone(rp.strip())
+        if norm:
+            phones.append(norm)
+    if not phones:
+        await update.message.reply_text("Не найдено ни одного корректного российского номера")
+        return
+
+    added = add_phones(phones, OWNER_ID)
+    if added:
+        await update.message.reply_text(f"➕ Добавлено новых номеров: {added}")
+
+    await update.message.reply_text(f"📤 Начинаю отправку на {len(phones)} номер(ов)...")
+    for phone in phones:
+        try:
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(None, send_whatsapp, phone, text)
+            mark_sent(phone)
+            send_to_telegram(f"✅ Отправлено на {phone}")
+        except Exception as e:
+            send_to_telegram(f"❌ Ошибка при отправке на {phone}: {e}")
+        await asyncio.sleep(15)
+    await update.message.reply_text("✅ Индивидуальная рассылка завершена")
+
+async def broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != OWNER_ID:
+        return
+    if not context.args:
+        await update.message.reply_text("Формат: /broadcast Текст сообщения")
+        return
+
+    text = " ".join(context.args)
+    phones = get_unsent_phones()
+    if not phones:
+        await update.message.reply_text("Нет неотправленных номеров")
+        return
+
+    await update.message.reply_text(f"📣 Начинаю рассылку на {len(phones)} номеров...")
+    for i, phone in enumerate(phones, 1):
+        try:
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(None, send_whatsapp, phone, text)
+            mark_sent(phone)
+            send_to_telegram(f"✅ [{i}/{len(phones)}] {phone}")
+        except Exception as e:
+            send_to_telegram(f"❌ [{i}/{len(phones)}] {phone}: {e}")
+        await asyncio.sleep(15)
+    await update.message.reply_text("✅ Массовая рассылка завершена")
+
+async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != OWNER_ID:
+        return
+    total, sent, unsent = get_stats()
+    await update.message.reply_text(
+        f"📊 Статистика номеров:\n"
+        f"• Всего: {total}\n"
+        f"• Отправлено: {sent}\n"
+        f"• Осталось: {unsent}"
+    )
+
+async def list_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != OWNER_ID:
+        return
+    phones = get_unsent_phones()
+    if not phones:
+        await update.message.reply_text("Все номера уже отправлены.")
+        return
+    text = "📋 Неотправленные номера:\n" + "\n".join(phones[:50])
+    if len(phones) > 50:
+        text += f"\n... и ещё {len(phones) - 50}"
+    await update.message.reply_text(text)
+
+async def reset_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != OWNER_ID:
+        return
+    if not context.args:
+        await update.message.reply_text("Формат: /reset 79161234567")
+        return
+    phone = normalize_phone(context.args[0])
+    if not phone:
+        await update.message.reply_text("Некорректный номер")
+        return
+    if reset_sent(phone):
+        await update.message.reply_text(f"✅ Статус для {phone} сброшен")
+    else:
+        await update.message.reply_text("Номер не найден в базе")
+
+async def reset_all_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != OWNER_ID:
+        return
+    reset_all_sent()
+    await update.message.reply_text("✅ Статус отправки сброшен для всех номеров")
+
+async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обрабатывает входящий текст: либо команда отправки для владельца, либо извлечение номеров."""
+    msg_text = update.message.text.strip()
+    # Если владелец и сообщение соответствует формату быстрой отправки
+    if update.effective_user.id == OWNER_ID:
+        m = re.match(r"^(\+\d{10,15})\s+(.+)$", msg_text, re.S)
+        if m:
+            phone_raw, text = m.groups()
+            norm = normalize_phone(phone_raw)
+            if norm:
+                # Сохраняем номер и отправляем
+                add_phones([norm], OWNER_ID)
+                await update.message.reply_text(f"📤 Отправляю на {norm}...")
+                try:
+                    loop = asyncio.get_running_loop()
+                    await loop.run_in_executor(None, send_whatsapp, norm, text)
+                    mark_sent(norm)
+                    await update.message.reply_text("✅ Отправлено!")
+                except Exception as e:
+                    await update.message.reply_text(f"❌ Ошибка: {e}")
+                return
+            else:
+                await update.message.reply_text("Некорректный номер телефона")
+                return
+
+    # Для всех (включая владельца, если формат не совпал) – извлечение номеров
+    phones = extract_phones(msg_text)
+    if not phones:
+        await update.message.reply_text("❌ Российские номера не найдены.")
+        return
+    new = add_phones(phones, update.effective_user.id)
+    await update.message.reply_text(f"✅ Найдено номеров: {len(phones)}. Добавлено новых: {new}.")
+
+async def pdf_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обрабатывает PDF-файл, извлекает номера."""
+    if not update.message.document:
+        return
+    if update.message.document.mime_type != "application/pdf":
+        await update.message.reply_text("Пожалуйста, пришлите PDF-файл.")
+        return
+
     try:
-        loop = asyncio.get_running_loop()
-        await loop.run_in_executor(None, send_whatsapp, phone, msg)
-        await update.message.reply_text("✅ Отправлено!")
+        file = await update.message.document.get_file()
+        buf = BytesIO()
+        await file.download_to_memory(buf)
+        buf.seek(0)
+
+        reader = PdfReader(buf)
+        full_text = ""
+        for page in reader.pages:
+            page_text = page.extract_text()
+            if page_text:
+                full_text += page_text + "\n"
+
+        if not full_text.strip():
+            await update.message.reply_text("Не удалось извлечь текст из PDF.")
+            return
+
+        phones = extract_phones(full_text)
+        if not phones:
+            await update.message.reply_text("❌ Российские номера в PDF не найдены.")
+            return
+
+        new = add_phones(phones, update.effective_user.id)
+        await update.message.reply_text(f"✅ Из PDF извлечено номеров: {len(phones)}. Добавлено новых: {new}.")
     except Exception as e:
-        await update.message.reply_text(f"❌ Ошибка: {e}")
+        await update.message.reply_text(f"❌ Ошибка при обработке PDF: {e}")
 
-
-# ==================== MAIN ====================
-
+# -------------------- MAIN --------------------
 def main():
     global bot_app, main_loop
 
     if not TOKEN:
         print("❌ Нет TELEGRAM_TOKEN")
         return
+
+    init_db()
 
     import requests as req
     for attempt in range(3):
@@ -763,10 +958,22 @@ def main():
         .build()
     )
 
+    # Старые команды
     bot_app.add_handler(CommandHandler("start", start_cmd))
     bot_app.add_handler(CommandHandler("debug", debug_cmd))
     bot_app.add_handler(CommandHandler("restart", restart_wa_cmd))
+
+    # Новые команды рассылки и управления номерами
+    bot_app.add_handler(CommandHandler("send", send_cmd))
+    bot_app.add_handler(CommandHandler("broadcast", broadcast_cmd))
+    bot_app.add_handler(CommandHandler("stats", stats_cmd))
+    bot_app.add_handler(CommandHandler("list", list_cmd))
+    bot_app.add_handler(CommandHandler("reset", reset_cmd))
+    bot_app.add_handler(CommandHandler("reset_all", reset_all_cmd))
+
+    # Приём номеров: текст (быстрая отправка для владельца + извлечение для всех)
     bot_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
+    bot_app.add_handler(MessageHandler(filters.Document.PDF, pdf_handler))
 
     main_loop = asyncio.new_event_loop()
     asyncio.set_event_loop(main_loop)
@@ -780,7 +987,6 @@ def main():
         poll_interval=2.0,
         timeout=20,
     )
-
 
 if __name__ == "__main__":
     main()
